@@ -1,0 +1,36 @@
+# DiskInsight Pro - Requirements
+
+## Core Requirements (Essential)
+customtkinter>=5.2.0  # Modern UI components
+watchdog
+
+## Performance Optimizations (Highly Recommended)
+pywin32>=305  # Windows API for faster scanning
+# Install with: pip install pywin32
+
+## All Requirements for Maximum Performance
+# Install all with: pip install -r requirements.txt
+customtkinter>=5.2.0
+pywin32>=305
+
+## Optional Future Requirements
+# matplotlib>=3.7.0  # For visualization charts
+# plotly>=5.14.0     # For interactive charts
+# psutil>=5.9.0      # For system information
+# Pillow>=10.0.0     # For image handling in UI
+
+## Installation Commands
+
+### For basic functionality:
+# pip install customtkinter
+
+### For maximum performance (recommended):
+# pip install customtkinter pywin32
+
+### For everything:
+# pip install -r requirements.txt
+
+## Notes:
+# - The optimized version will work without pywin32 but will be slower
+# - pywin32 enables direct Windows API calls for 5-10x faster scanning
+# - customtkinter provides modern dark theme UI

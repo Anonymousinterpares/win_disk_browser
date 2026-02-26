@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>DiskInsight Pro</title>
+    <link rel="stylesheet" href="css/style.css">
+    <!-- ECharts Library from a CDN -->
+    <script src="https://cdn.jsdelivr.net/npm/echarts@5.4.3/dist/echarts.min.js"></script>
+    <!-- jsTree for TreeView mode -->
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/jstree/3.3.12/themes/default/style.min.css" />
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jquery/3.6.0/jquery.min.js"></script>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/jstree/3.3.12/jstree.min.js"></script>
+</head><body>
+    <div class="container">
+        <div class="toolbar">
+            <!-- Toolbar content remains the same -->
+            <label for="drive-select">Select Drive:</label>
+            <select id="drive-select"></select>
+            <button id="scan-button">Scan Fresh</button>
+            <button id="cache-button">Load from Cache</button>
+            <div class="spacer"></div>
+            <div class="search-wrapper">
+                <input type="search" id="search-input" placeholder="Search for a file or folder...">
+                <div id="search-results-container"></div>
+            </div>
+            <button id="reset-view-button" title="Reset View" class="icon-button" style="display: none;">🏠</button>
+            <div id="treemap-mode-toggle" class="view-toggle" style="margin-right: 20px;">
+                <button id="treeview-mode-btn" class="mode-button active" title="Fast TreeView explorer">TreeView</button>
+                <button id="structure-mode-btn" class="mode-button" title="Hierarchical folder browsing">Structure</button>
+                <button id="toplist-mode-btn" class="mode-button" title="View largest files/folders">Top List</button>
+            </div>
+            <div class="view-toggle">
+                <span>Treemap</span>
+                <label class="switch">
+                    <input type="checkbox" id="chart-toggle">
+                    <span class="slider"></span>
+                </label>
+                <span>Sunburst</span>
+            </div>
+        </div>
+        <div id="top-list-controls" class="sub-toolbar" style="display: none;">
+            <!-- Top list controls remain the same -->
+            <div class="control-group">
+                <label><input type="radio" name="toplist-type" value="folders" checked> Largest Folders</label>
+                <label><input type="radio" name="toplist-type" value="files"> Largest Files</label>
+            </div>
+            <div class="control-group slider-group">
+                <button id="toplist-prev-btn" class="slider-btn">-</button>
+                <input type="range" id="toplist-slider" min="0" max="100" value="0">
+                <button id="toplist-next-btn" class="slider-btn">+</button>
+                <span id="toplist-counter"></span>
+            </div>
+        </div>
+        
+        <div class="main-content-wrapper">
+            <div id="breadcrumb-container"></div>
+            <div id="chart-container"></div>
+            <div id="treeview-container" style="display: none;">
+                <div class="explorer-container">
+                    <!-- Left Panel - Directory Tree -->
+                    <div class="tree-panel">
+                        <div class="tree-header">
+                            <span class="tree-title">Folders</span>
+                            <div class="tree-controls">
+                                <input type="text" id="tree-search" placeholder="Search folders..." class="tree-search-input">
+                                <button id="expand-all-btn" class="tree-btn">Expand All</button>
+                                <button id="collapse-all-btn" class="tree-btn">Collapse All</button>
+                            </div>
+                        </div>
+                        <div id="tree-view" class="tree-content"></div>
+                    </div>
+                    
+                    <!-- Right Panel - File List -->
+                    <div class="file-panel">
+                        <div class="file-header">
+                            <div class="navigation-controls">
+                                <button id="nav-back-btn" class="nav-btn" title="Go back (Backspace)" disabled>
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                                        <path d="m15 18-6-6 6-6"/>
+                                    </svg>
+                                </button>
+                                <button id="nav-forward-btn" class="nav-btn" title="Go forward" disabled>
+                                    <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.5" stroke-linecap="round" stroke-linejoin="round">
+                                        <path d="m9 18 6-6-6-6"/>
+                                    </svg>
+                                </button>
+                            </div>
+                            <div id="tree-breadcrumb" class="breadcrumb"></div>
+                        </div>
+                        <div id="file-list" class="file-content"></div>
+                    </div>
+                </div>
+            </div>
+        </div>
+
+        <div id="status-bar">Ready. Select a drive and click Scan.</div>
+    </div>
+    <div id="context-menu" class="context-menu"></div>
+    
+    <script src="js/main.js"></script>
+</body>
+</html>

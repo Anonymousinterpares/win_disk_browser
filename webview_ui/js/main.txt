@@ -1,0 +1,1035 @@
+// REAL FIX: Manual Zoom Implementation - No more detection, we CREATE zoom manually
+window.addEventListener('pywebviewready', function() {
+    // --- DOM ELEMENTS ---
+    const driveSelect = document.getElementById('drive-select');
+    const scanButton = document.getElementById('scan-button');
+    const cacheButton = document.getElementById('cache-button');
+    const chartToggle = document.getElementById('chart-toggle');
+    const chartContainer = document.getElementById('chart-container');
+    const statusBar = document.getElementById('status-bar');
+    const searchInput = document.getElementById('search-input');
+    const searchResultsContainer = document.getElementById('search-results-container');
+    const resetViewButton = document.getElementById('reset-view-button');
+    const breadcrumbContainer = document.getElementById('breadcrumb-container');
+    const contextMenu = document.getElementById('context-menu');
+    const liveModeToggle = document.getElementById('live-mode-toggle');
+    const heatmapOverlayToggle = document.getElementById('heatmap-overlay-toggle'); // Add this
+    const overlayContainer = document.getElementById('overlay-container');       // Add this
+
+
+    // --- STATE MANAGEMENT ---
+    let chartInstance = echarts.init(chartContainer, 'dark');
+    let currentView = 'treemap';
+    let currentPath = '';
+    let currentZoom = 1.0;
+    let navStack = [];
+    let viewportSize = { width: 1280, height: 800 };
+    let isQuickPreview = false;
+    let aggregationData = new Map(); 
+    let currentRootPath = '';
+
+    // --- HELPER FUNCTIONS ---
+    function formatSize(bytes) {
+        if (bytes === 0) return '0 B';
+        const k = 1024;
+        const sizes = ['B', 'KB', 'MB', 'GB', 'TB', 'PB'];
+        const i = Math.floor(Math.log(bytes) / Math.log(k));
+        return parseFloat((bytes / Math.pow(k, i)).toFixed(2)) + ' ' + sizes[i];
+    }
+
+    function debounce(func, delay) {
+        let timer;
+        return function(...args) {
+            clearTimeout(timer);
+            timer = setTimeout(() => func.apply(this, args), delay);
+        };
+    }
+
+    function getViewportSize() {
+        return {
+            width: chartContainer.offsetWidth,
+            height: chartContainer.offsetHeight
+        };
+    }
+
+    // --- API COMMUNICATION ---
+    pywebview.api.get_drives().then(drives => {
+        drives.forEach(drive => {
+            const option = document.createElement('option');
+            option.value = drive;
+            option.textContent = drive;
+            driveSelect.appendChild(option);
+        });
+    }).catch(error => {
+        console.error('Error getting drives:', error);
+        statusBar.textContent = 'Error loading drives';
+    });
+
+    window.addEventListener('resize', debounce(() => {
+        viewportSize = getViewportSize();
+        chartInstance.resize();
+        
+        if (currentPath && currentView === 'treemap' && treemapMode === 'heatmap') {
+            requestHeatmapView(currentPath, currentZoom);
+        }
+    }, 250));
+
+    // --- API REQUEST FUNCTIONS ---
+    const requestTreemapView = debounce((path, zoom) => {
+        console.log(`[Treemap] Requesting view: Path="${path}", Zoom=${zoom.toFixed(2)}`);
+        statusBar.textContent = `Loading ${path}...`;
+        
+        pywebview.api.get_adaptive_lod_view(
+            path, 
+            zoom, 
+            viewportSize.width, 
+            viewportSize.height
+        ).then(data => {
+            if (data) {
+                renderView(data);
+                statusBar.textContent = `Ready - Click to drill down | Scroll to zoom`;
+            }
+        }).catch(error => {
+            console.error('Error getting treemap view:', error);
+            statusBar.textContent = 'Error loading treemap view';
+        });
+    }, 250); // A 250ms debounce feels responsive without spamming the backend
+
+// Live Mode Toggle Handler
+    liveModeToggle.addEventListener('change', () => {
+        if (liveModeToggle.checked) {
+            statusBar.textContent = 'Enabling Live Mode...';
+            pywebview.api.start_live_updates(currentRootPath).then(success => {
+                if (success) {
+                    statusBar.textContent = 'Live Mode Enabled. Monitoring for changes...';
+                } else {
+                    statusBar.textContent = 'Failed to enable Live Mode.';
+                    liveModeToggle.checked = false;
+                }
+            });
+        } else {
+            statusBar.textContent = 'Disabling Live Mode...';
+            pywebview.api.stop_live_updates().then(success => {
+                if (success) {
+                    statusBar.textContent = 'Live Mode Disabled.';
+                } else {
+                    statusBar.textContent = 'Failed to disable Live Mode.';
+                }
+            });
+        }
+    });
+
+    function renderTreemap(data, isNavigatingBack = false) {
+        if (!data || typeof data !== 'object' || !data.path) {
+            console.error('Invalid data for treemap rendering:', data);
+            return;
+        }
+        
+        if (!data.children || !Array.isArray(data.children)) { data.children = []; }
+        
+        currentPath = data.path;
+        if (!isNavigatingBack) { navStack.push(JSON.parse(JSON.stringify(data))); }
+        
+        const option = {
+            tooltip: { /* ... (same as before) ... */ },
+            backgroundColor: '#1a1a2e',
+            series: [{
+                type: 'treemap',
+                name: data.name, 
+                value: data.value,
+                data: data.children.length > 0 ? data.children : [{name: 'Empty Folder', value: 1, itemStyle: {color: '#444'}}],
+                animationDurationUpdate: 300,
+                // --- CORE CHANGE: Enable ECharts' built-in zoom and pan ---
+                roam: true, 
+                nodeClick: false, // We handle clicks manually for precise control
+                breadcrumb: { show: false },
+                levels: [ /* ... (same as before) ... */ ],
+                label: { /* ... (same as before) ... */ },
+                upperLabel: {
+                    show: true, 
+                    height: 30, 
+                    color: '#fff', 
+                    backgroundColor: 'rgba(0, 0, 0, 0.3)',
+                    formatter: params => `Total size of contents in '${params.name}': ${formatSize(params.value)}`
+                }
+            }]
+        };
+        
+        try {
+            chartInstance.clear();
+            chartInstance.setOption(option, { notMerge: true });
+        } catch (error) { console.error("ECharts rendering failed:", error); }
+
+        // --- DYNAMIC LOD LISTENER ---
+        // Remove old listener and attach the new one
+        chartInstance.off('dataZoom'); 
+        chartInstance.on('dataZoom', function () {
+            // After ECharts performs a visual zoom, this event fires.
+            const newZoom = chartInstance.getOption().series[0].zoom;
+            if (newZoom && Math.abs(newZoom - currentZoom) > 0.01) {
+                currentZoom = newZoom;
+                // Request new data with a higher level of detail for the current view
+                requestTreemapView(currentPath, currentZoom);
+            }
+        });
+
+        // After rendering, check if the overlay needs to be redrawn
+        if (heatmapOverlayToggle.checked) {
+            drawLargestFilesOverlay();
+        }
+    }
+
+    const requestHeatmapView = debounce((path, zoom) => {
+        console.log(`[Heatmap] Manual zoom request: Path="${path}", Zoom=${zoom.toFixed(2)}`);
+        statusBar.textContent = `Updating detail level (zoom: ${zoom.toFixed(1)}x)...`;
+        
+        pywebview.api.get_adaptive_lod_view(
+            path, 
+            zoom, 
+            viewportSize.width, 
+            viewportSize.height
+        ).then(data => {
+            if (data) {
+                renderView(data);
+                statusBar.textContent = `Heatmap Mode - Scroll over folders to zoom IN | Scroll up or press - to zoom OUT`;
+            }
+        }).catch(error => {
+            console.error('Error getting LOD view:', error);
+            statusBar.textContent = 'Error loading heatmap view';
+        });
+    }, 250);
+
+    // --- SPATIAL ZOOM IMPLEMENTATION ---
+    let zoomStack = []; // Track zoom history for spatial zoom out
+    
+
+    // --- RENDERING FUNCTIONS ---
+    function renderView(data, isNavigatingBack = false) {
+        // This is the central dispatcher for rendering.
+        if (currentView === 'treemap') {
+            // FIX: This now correctly calls the single, unified 'renderTreemap' function.
+            renderTreemap(data, isNavigatingBack);
+        } else {
+            renderEnhancedSunburst(data, isNavigatingBack);
+        }
+        updateBreadcrumb(data.path);
+        resetViewButton.style.display = 'block';
+        resetViewButton.title = 'Reset to root view (Esc key)';
+    }
+
+    function renderEnhancedSunburst(data, isNavigatingBack = false) {
+        currentPath = data.path;
+        if (!isNavigatingBack) {
+            navStack.push(JSON.parse(JSON.stringify(data)));
+        }
+        
+        const normalizedPath = data.path.replace(/\\/g, '/');
+        const pathParts = normalizedPath.split('/').filter(p => p);
+        const folderName = data.name || pathParts[pathParts.length - 1] || pathParts[0] || 'Root';
+        
+        if (!data.children || !Array.isArray(data.children)) {
+            data.children = [];
+        }
+        
+        const option = {
+            backgroundColor: '#1a1a2e',
+            title: {
+                text: folderName,
+                textStyle: {
+                    fontSize: 18,
+                    color: '#fff',
+                    fontWeight: 'normal'
+                },
+                left: 'center',
+                top: 'center'
+            },
+            tooltip: {
+                formatter: info => {
+                    const item = info.data;
+                    let tooltip = `<strong>${item.name}</strong><br>`;
+                    tooltip += `Path: ${item.path || 'N/A'}<br>`;
+                    tooltip += `Size: ${formatSize(item.value || 0)}`;
+                    
+                    if (item.hasMore || item.aggregated) {
+                        tooltip += `<br><em>Click to explore</em>`;
+                    }
+                    
+                    return tooltip;
+                }
+            },
+            series: [{
+                type: 'sunburst',
+                data: data.children.length > 0 ? data.children : 
+                      [{name: 'Empty folder', value: 1, itemStyle: {color: '#444'}}],
+                radius: [60, '95%'],
+                minAngle: 2,
+                sort: 'desc',
+                renderLabelForZeroData: false,
+                label: {
+                    rotate: 'tangential',
+                    show: true,
+                    overflow: 'truncate',
+                    minAngle: 5,
+                    formatter: function(params) {
+                        const name = params.data.name;
+                        if (name.length > 15) {
+                            return name.substring(0, 12) + '...';
+                        }
+                        return name;
+                    }
+                },
+                itemStyle: {
+                    borderRadius: 7,
+                    borderWidth: 2,
+                    borderColor: '#1a1a1a'
+                },
+                emphasis: {
+                    focus: 'ancestor',
+                    itemStyle: {
+                        shadowBlur: 10,
+                        shadowColor: 'rgba(0, 0, 0, 0.5)'
+                    }
+                },
+                levels: [
+                    {},
+                    {
+                        r0: '20%',
+                        r: '40%',
+                        itemStyle: {
+                            borderWidth: 2
+                        },
+                        label: {
+                            position: 'outside',
+                            silent: false
+                        }
+                    },
+                    {
+                        r0: '40%',
+                        r: '65%',
+                        label: {
+                            position: 'outside',
+                            padding: 3,
+                            silent: false
+                        }
+                    },
+                    {
+                        r0: '65%',
+                        r: '85%',
+                        label: {
+                            position: 'outside',
+                            padding: 3,
+                            silent: false
+                        }
+                    }
+                ]
+            }]
+        };
+        
+        chartInstance.clear();
+        chartInstance.setOption(option);
+    }
+
+    // --- LARGEST FILES OVERLAY ---
+    heatmapOverlayToggle.addEventListener('change', () => {
+        if (heatmapOverlayToggle.checked) {
+            drawLargestFilesOverlay();
+        } else {
+            clearLargestFilesOverlay();
+        }
+    });
+
+    function clearLargestFilesOverlay() {
+        overlayContainer.innerHTML = '';
+        overlayContainer.style.display = 'none';
+    }
+
+    function drawLargestFilesOverlay() {
+        clearLargestFilesOverlay();
+        if (!currentPath || currentView !== 'treemap') return;
+
+        statusBar.textContent = 'Finding largest files in current view...';
+        pywebview.api.get_largest_files_in_view(currentPath, 20).then(files => {
+            overlayContainer.style.display = 'block';
+            const viewRect = chartContainer.getBoundingClientRect();
+
+            files.forEach(file => {
+                // ECharts API to convert a data path to pixel coordinates.
+                // This is how we find where the parent block is drawn.
+                const parentCoords = chartInstance.convertToPixel({seriesIndex: 0}, file.parent_path);
+
+                if (parentCoords) {
+                    const overlay = document.createElement('div');
+                    overlay.className = 'heatmap-overlay-file';
+                    
+                    // Use a simple title for the overlay text
+                    const fileName = file.path.substring(file.path.lastIndexOf('\\') + 1);
+                    overlay.textContent = fileName;
+                    
+                    // Use a detailed tooltip for the full info
+                    overlay.title = `File: ${file.path}\nSize: ${formatSize(file.size)}`;
+                    
+                    // Position the overlay relative to the chart container
+                    overlay.style.left = `${parentCoords[0] - viewRect.left}px`;
+                    overlay.style.top = `${parentCoords[1] - viewRect.top}px`;
+
+                    // Add right-click to open location
+                    overlay.addEventListener('contextmenu', e => {
+                        e.preventDefault();
+                        e.stopPropagation(); // Prevent the main chart context menu
+                        pywebview.api.open_location(file.path);
+                    });
+
+                    overlayContainer.appendChild(overlay);
+                }
+            });
+            statusBar.textContent = 'Ready.';
+        }).catch(error => console.error("Error fetching largest files:", error));
+    }
+
+    // --- EVENT HANDLERS ---
+    chartInstance.on('click', function(params) {
+        if (!params.data) return;
+        const clickedData = params.data;
+
+        if (currentView === 'treemap') {
+            // --- UNIFIED CLICK LOGIC ---
+            // If it's a directory or an aggregated block, navigate into it.
+            if (clickedData.is_dir || clickedData.aggregated) {
+                currentZoom = 1.0; // Reset zoom when navigating
+                requestTreemapView(clickedData.path, currentZoom);
+            }
+        } 
+        else if (currentView === 'sunburst') {
+            if (clickedData.path && (clickedData.hasMore || clickedData.aggregated || clickedData.is_dir)) {
+                pywebview.api.get_sunburst_adaptive_view(clickedData.path, 4).then(newData => {
+                    if (newData) {
+                        renderView(newData);
+                    }
+                }).catch(error => {
+                    console.error('Error loading sunburst view:', error);
+                });
+            }
+        }
+    });
+
+
+    // Search functionality
+    const debouncedSearch = debounce((query) => {
+        pywebview.api.search_nodes(query).then(displaySearchResults);
+    }, 300);
+
+    searchInput.addEventListener('input', () => {
+        const query = searchInput.value.trim();
+        if (query.length < 2) {
+            searchResultsContainer.style.display = 'none';
+            return;
+        }
+        debouncedSearch(query);
+    });
+
+function displaySearchResults(results) {
+        searchResultsContainer.innerHTML = '';
+        
+        if (results.length === 0) {
+            searchResultsContainer.innerHTML = '<div class="no-results">No results found.</div>';
+        } else {
+            results.forEach(item => {
+                const resultItem = document.createElement('div');
+                resultItem.className = 'search-result-item';
+                resultItem.innerHTML = `
+                    <span class="name">${item.name}</span>
+                    <span class="path">${item.path}</span>
+                    <span class="size">${formatSize(item.value)}</span>
+                `;
+                resultItem.addEventListener('click', () => {
+                    const parentPath = item.path.substring(0, item.path.lastIndexOf('\\'));
+                    if (parentPath) {
+                        // FIX: This now correctly calls the unified 'requestTreemapView'.
+                        currentZoom = 1.0; // Reset zoom on navigation
+                        requestTreemapView(parentPath || item.path, currentZoom);
+                    }
+                    searchInput.value = '';
+                    searchResultsContainer.style.display = 'none';
+                });
+                searchResultsContainer.appendChild(resultItem);
+            });
+        }
+        
+        searchResultsContainer.style.display = 'block';
+    }
+
+    // Scan button
+    scanButton.addEventListener('click', () => {
+        const selectedDrive = driveSelect.value;
+        if (!selectedDrive) {
+            statusBar.textContent = 'Please select a drive.';
+            return;
+        }
+        
+        currentRootPath = selectedDrive;
+        navStack = [];
+        aggregationData.clear();
+        
+        statusBar.textContent = `Scanning ${selectedDrive}...`;
+        scanButton.disabled = true;
+        cacheButton.disabled = true;
+        driveSelect.disabled = true;
+        chartInstance.showLoading({
+            text: 'Scanning disk...',
+            color: '#0078d4',
+            maskColor: 'rgba(0, 0, 0, 0.8)'
+        });
+        
+        viewportSize = getViewportSize();
+        pywebview.api.set_viewport && pywebview.api.set_viewport(viewportSize.width, viewportSize.height);
+        
+        isQuickPreview = false;
+        try {
+            pywebview.api.start_scan(selectedDrive);
+        } catch (error) {
+            console.error('Error starting scan:', error);
+            window.onScanFailed('Failed to start scan: ' + (error.message || error));
+        }
+    });
+
+    // Cache button
+    cacheButton.addEventListener('click', () => {
+        const selectedDrive = driveSelect.value;
+        if (!selectedDrive) {
+            statusBar.textContent = 'Please select a drive.';
+            return;
+        }
+        
+        currentRootPath = selectedDrive;
+        navStack = [];
+        aggregationData.clear();
+        
+        statusBar.textContent = `Loading cache for ${selectedDrive}...`;
+        scanButton.disabled = true;
+        cacheButton.disabled = true;
+        driveSelect.disabled = true;
+        chartInstance.showLoading({
+            text: 'Loading from cache...',
+            color: '#0078d4',
+            maskColor: 'rgba(0, 0, 0, 0.8)'
+        });
+        cacheButton.textContent = 'Refresh Cache';
+
+        viewportSize = getViewportSize();
+        if (pywebview.api.set_viewport) {
+            pywebview.api.set_viewport(viewportSize.width, viewportSize.height);
+        }
+        
+        try {
+            pywebview.api.load_from_cache(selectedDrive);
+        } catch (error) {
+            console.error('Cache load error:', error);
+            window.onScanFailed('Cache load error: ' + (error.message || error));
+        }
+        liveModeToggle.checked = false;
+        liveModeToggle.disabled = true;
+    });
+
+    // View toggle
+    chartToggle.addEventListener('change', () => {
+        currentView = chartToggle.checked ? 'sunburst' : 'treemap';
+        // The structure/heatmap toggle is gone, so no need to show/hide it.
+        if (currentPath) {
+            navStack = [];
+            if (currentView === 'sunburst') {
+                pywebview.api.get_sunburst_adaptive_view(currentPath, 4).then(data => {
+                    if (data) renderView(data);
+                });
+            } else {
+                // When switching to treemap, just show the current path.
+                currentZoom = 1.0;
+                requestTreemapView(currentPath, currentZoom);
+            }
+        }
+    });
+
+    // Reset view button
+    resetViewButton.addEventListener('click', () => {
+        if (currentRootPath) {
+            navStack = [];
+            currentZoom = 1.0;
+            if (currentView === 'sunburst') {
+                pywebview.api.get_sunburst_adaptive_view(currentRootPath, 4).then(data => {
+                    if (data) renderEnhancedSunburst(data, false);
+                });
+            } else {
+                requestTreemapView(currentRootPath, currentZoom);
+            }
+        }
+    });
+
+    // Breadcrumb navigation
+    function updateBreadcrumb(path) {
+        breadcrumbContainer.innerHTML = '';
+        if (!path) return;
+        
+        const parts = path.replace(/\\/g, '/').split('/').filter(p => p);
+        let pathSegments = [];
+
+        parts.forEach((part, index) => {
+            pathSegments.push(part);
+            
+            let currentBuiltPath = pathSegments.join('\\');
+            if (index === 0 && currentBuiltPath.endsWith(':')) {
+                currentBuiltPath += '\\';
+            }
+            
+            if (index > 0) {
+                const separator = document.createElement('span');
+                separator.className = 'breadcrumb-separator';
+                separator.textContent = ' › ';
+                breadcrumbContainer.appendChild(separator);
+            }
+
+            const link = document.createElement('a');
+            link.className = 'breadcrumb-link';
+            link.textContent = part;
+            link.setAttribute('data-path', currentBuiltPath);
+            
+            link.addEventListener('click', (event) => {
+                const targetPath = event.currentTarget.getAttribute('data-path');
+                
+                navStack = []; 
+                if (currentView === 'sunburst') {
+                    pywebview.api.get_sunburst_adaptive_view(targetPath, 4).then(data => {
+                        if(data) renderView(data);
+                    });
+                } else {
+                    currentZoom = 1.0;
+                    requestTreemapView(targetPath, currentZoom);
+                }
+            });
+            
+            breadcrumbContainer.appendChild(link);
+        });
+    }
+    
+    function showContextMenu(x, y, hoveredData = null) {
+        let itemData = hoveredData;
+        if (!itemData) {
+            const rect = chartContainer.getBoundingClientRect();
+            itemData = getBlockUnderMouse(x - rect.left, y - rect.top);
+        }
+        
+        if (!itemData || !itemData.path) {
+            console.log('No valid item data for context menu');
+            return;
+        }
+    
+        contextMenu.innerHTML = '';
+        contextMenu.style.left = `${x}px`;
+        contextMenu.style.top = `${y}px`;
+        contextMenu.style.display = 'block';
+
+        const isRealPath = itemData.path && !itemData.path.includes('\\[');
+        
+        // --- Core "Open Location" Feature ---
+        if (isRealPath) {
+            const openLocationItem = document.createElement('div');
+            openLocationItem.className = 'context-menu-item';
+            openLocationItem.innerHTML = '🗂️ Open Location';
+            openLocationItem.onclick = () => {
+                contextMenu.style.display = 'none';
+                pywebview.api.open_location(itemData.path);
+            };
+            contextMenu.appendChild(openLocationItem);
+        }
+
+        // --- Treemap-Specific Features ---
+        if (currentView === 'treemap') {
+            if(isRealPath) {
+                const separator = document.createElement('div');
+                separator.className = 'context-menu-separator';
+                contextMenu.appendChild(separator);
+            }
+
+            // "Explore This" is for directories or aggregated blocks
+            if (itemData.is_dir || itemData.aggregated) {
+                const exploreItem = document.createElement('div');
+                exploreItem.className = 'context-menu-item';
+                exploreItem.innerHTML = '🔍 Explore This';
+                exploreItem.onclick = () => {
+                    contextMenu.style.display = 'none';
+                    spatialZoomIntoBlock(itemData);
+                };
+                contextMenu.appendChild(exploreItem);
+            }
+
+            // "Go Up" is always available
+            const zoomOutItem = document.createElement('div');
+            zoomOutItem.className = 'context-menu-item';
+            zoomOutITem.innerHTML = '🔙 Go Up / Zoom Out';
+            zoomOutItem.onclick = () => {
+                contextMenu.style.display = 'none';
+                spatialZoomOut();
+            };
+            contextMenu.appendChild(zoomOutItem);
+        }
+        
+        // --- Sunburst-Specific Features ---
+        if (currentView === 'sunburst' && isRealPath && itemData.is_dir) {
+            const separator = document.createElement('div');
+            separator.className = 'context-menu-separator';
+            contextMenu.appendChild(separator);
+            
+            const exploreInSunburstItem = document.createElement('div');
+            exploreInSunburstItem.className = 'context-menu-item';
+            exploreInSunburstItem.innerHTML = '☀️ Explore in Sunburst';
+            exploreInSunburstItem.onclick = () => {
+                contextMenu.style.display = 'none';
+                pywebview.api.get_sunburst_adaptive_view(itemData.path, 4).then(newData => {
+                    if (newData) renderView(newData);
+                });
+            };
+            contextMenu.appendChild(exploreInSunburstItem);
+        }
+    }
+
+    function spatialZoomIntoBlock(blockData) {
+        if (!blockData || !blockData.path) return;
+
+        // An aggregated item is a virtual folder we can explore
+        const isAggregated = blockData.aggregated === true || blockData.path.includes('\\[');
+        if (isAggregated) {
+            const parentPath = blockData.path.substring(0, blockData.path.lastIndexOf('\\['));
+            pywebview.api.expand_aggregation(parentPath, blockData.path).then(items => {
+                if (items && items.length > 0) {
+                    zoomStack.push({ path: currentPath });
+                    const expandedData = { name: blockData.name, path: blockData.path, value: blockData.value, children: items };
+                    renderView(expandedData);
+                }
+            });
+            return;
+        }
+
+        // Only zoom into actual directories
+        if (blockData.is_dir) {
+            zoomStack.push({ path: currentPath });
+            requestTreemapView(blockData.path, 1.0);
+        }
+    }
+
+    function spatialZoomOut() {
+        if (zoomStack.length > 0) {
+            const previousState = zoomStack.pop();
+            requestTreemapView(previousState.path, 1.0);
+        } else {
+            // If stack is empty, go to parent directory as a fallback
+            const isRoot = currentPath.endsWith(':\\') && currentPath.length === 3;
+            if (currentPath && !isRoot) {
+                let parentPath = currentPath.substring(0, currentPath.lastIndexOf('\\'));
+                if (!parentPath.includes('\\')) parentPath += '\\';
+                requestTreemapView(parentPath, 1.0);
+            }
+        }
+    }
+
+    function getBlockUnderMouse(mouseX, mouseY) {
+        // This function attempts to find the data for the block under the cursor
+        // by inspecting ECharts' internal structures.
+        try {
+            const hoveredElement = chartInstance.getZr().handler.findHover(mouseX, mouseY);
+            if (hoveredElement && hoveredElement.target) {
+                const target = hoveredElement.target;
+                
+                // The most reliable way to get data is often through an internal property
+                // that holds the data index.
+                for (const prop of Object.keys(target)) {
+                    if (prop.startsWith('__ec_inner_')) {
+                        if (target[prop] && typeof target[prop].dataIndex === 'number') {
+                            const dataIndex = target[prop].dataIndex;
+                            const seriesModel = chartInstance.getModel().getComponent('series', 0);
+                            if (seriesModel) {
+                                const rawDataItem = seriesModel.getData().getRawDataItem(dataIndex);
+                                if (rawDataItem && rawDataItem.path) {
+                                    return rawDataItem; // Success!
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (e) {
+            console.error('Error in getBlockUnderMouse:', e);
+        }
+        return null; // Return null if no valid data is found
+    }
+
+    chartContainer.addEventListener('contextmenu', (e) => {
+        e.preventDefault();
+        
+        // Get the item under the mouse cursor
+        const rect = chartContainer.getBoundingClientRect();
+        const chartX = e.clientX - rect.left;
+        const chartY = e.clientY - rect.top;
+        
+        console.log('Right-click detected at chart coordinates:', chartX, chartY);
+        
+        // Try to get the item data under the mouse
+        let itemData = null;
+        
+        if (currentView === 'treemap') {
+            itemData = getBlockUnderMouse(chartX, chartY);
+        } else if (currentView === 'sunburst') {
+            // For sunburst, we need to use ECharts' built-in methods
+            try {
+                const hoveredElement = chartInstance.getZr().handler.findHover(chartX, chartY);
+                if (hoveredElement && hoveredElement.target) {
+                    // Try to extract data from sunburst element
+                    const target = hoveredElement.target;
+                    
+                    // Check various ECharts internal properties for sunburst data
+                    if (target.__ecData) {
+                        itemData = target.__ecData;
+                    } else {
+                        // Look for data in internal properties
+                        for (const prop of Object.keys(target)) {
+                            if (prop.startsWith('__ec_inner_')) {
+                                if (target[prop] && typeof target[prop].dataIndex === 'number') {
+                                    const dataIndex = target[prop].dataIndex;
+                                    const option = chartInstance.getOption();
+                                    if (option.series && option.series[0] && option.series[0].data) {
+                                        const candidateData = option.series[0].data[dataIndex];
+                                        if (candidateData && candidateData.path) {
+                                            itemData = candidateData;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (error) {
+                console.log('Error getting sunburst item data:', error);
+            }
+        }
+        
+        console.log('Item data found for context menu:', itemData);
+        
+        // Show context menu with the found item data
+        showContextMenu(e.clientX, e.clientY, itemData);
+    });
+
+    // Hide context menu and search results
+    document.addEventListener('click', (e) => {
+        if (!contextMenu.contains(e.target)) {
+            contextMenu.style.display = 'none';
+        }
+        if (!searchResultsContainer.contains(e.target) && e.target !== searchInput) {
+            searchResultsContainer.style.display = 'none';
+        }
+    });
+
+    // --- GLOBAL CALLBACK FUNCTIONS ---
+
+    window.onDataChanged = function(changedDirs) {
+        console.log("Live update received. Changes in:", changedDirs);
+        statusBar.textContent = "Live update received, checking for refresh...";
+
+        let needsRefresh = false;
+        for (const dir of changedDirs) {
+            // If the current path is inside a changed directory, we need to refresh.
+            if (currentPath.startsWith(dir)) {
+                needsRefresh = true;
+                break;
+            }
+        }
+
+        if (needsRefresh) {
+            console.log("Current view is affected. Refreshing...");
+            // Re-request the data for the current view
+            if (currentView === 'treemap') {
+                 if (treemapMode === 'structure') {
+                    requestStructureView(currentPath);
+                } else if (treemapMode === 'heatmap') {
+                    // For heatmap, a simple refresh might not be enough, but this is a start
+                    requestHeatmapView(currentPath, currentZoom);
+                }
+            } else if (currentView === 'sunburst') {
+                 pywebview.api.get_sunburst_adaptive_view(currentPath, 4).then(data => {
+                    if (data) renderView(data);
+                });
+            }
+        } else {
+             console.log("Current view is not affected. No refresh needed.");
+             statusBar.textContent = "Live Mode Enabled. Monitoring for changes...";
+        }
+    };
+        
+    window.onQuickPreview = function(data) {
+        console.log('Quick preview received:', data);
+        isQuickPreview = true;
+        chartInstance.hideLoading();
+        chartInstance.showLoading({
+            text: 'Quick preview loaded. Full scan in progress...',
+            color: '#00aa00',
+            maskColor: 'rgba(0, 0, 0, 0.5)'
+        });
+        
+        if (data) {
+            if (!data.children || !Array.isArray(data.children)) {
+                data.children = [];
+            }
+            currentPath = data.path;
+            currentRootPath = data.path;
+            renderView(data);
+            statusBar.textContent = 'Quick preview ready. Full scan continuing...';
+        }
+    };
+
+    window.onScanComplete = function(data) {
+        // This is now ONLY for cache loading
+        console.log('Cache load complete:', data);
+        navStack = [];
+        currentZoom = 1.0;
+        
+        chartInstance.hideLoading();
+        scanButton.disabled = false;
+        cacheButton.disabled = false;
+        driveSelect.disabled = false;
+        liveModeToggle.disabled = false; // The critical fix
+        
+        if (data) {
+            currentRootPath = data.path;
+            currentPath = data.path;
+            renderView(data);
+            statusBar.textContent = `Cache loaded.`;
+        } else {
+            onCacheMiss();
+        }
+        isQuickPreview = false;
+    };
+
+window.onScanFinallyComplete = function() {
+        console.log("Backend signaled full scan is complete. Now pulling final data...");
+        statusBar.textContent = 'Scan complete. Fetching final data...';
+        
+        // Now we call the new API endpoint to get the data.
+        pywebview.api.get_final_scan_data().then(data => {
+            // This is the logic from the old onScanComplete function.
+            console.log('Final scan data received:', data);
+            navStack = [];
+            currentZoom = 1.0;
+            
+            chartInstance.hideLoading(); // This will finally remove the "Quick preview..." message.
+            scanButton.disabled = false;
+            cacheButton.disabled = false;
+            driveSelect.disabled = false;
+            liveModeToggle.disabled = false; 
+            
+            if (data) {
+                currentRootPath = data.path;
+                currentPath = data.path;
+                
+                setTreemapMode('structure');
+                renderView(data);
+                statusBar.textContent = `Scan complete. Use Backspace to go up, Esc to reset`;
+            } else {
+                statusBar.textContent = 'Scan completed but failed to retrieve final data.';
+            }
+            isQuickPreview = false;
+        }).catch(error => {
+            console.error("Failed to pull final scan data:", error);
+            onScanFailed("Error retrieving final scan results.");
+        });
+    };
+
+    window.onCacheMiss = function() {
+        statusBar.textContent = 'No cache found. Please perform a fresh scan.';
+        scanButton.disabled = false;
+        cacheButton.disabled = false;
+        driveSelect.disabled = false;
+        liveModeToggle.disabled = true;
+        chartInstance.hideLoading();
+    };
+
+    window.onScanFailed = function(message = 'Scan failed. Please check permissions.') {
+        console.error('Scan failed:', message);
+        statusBar.textContent = message;
+        scanButton.disabled = false;
+        cacheButton.disabled = false;
+        driveSelect.disabled = false;
+        liveModeToggle.disabled = true; 
+        chartInstance.hideLoading();
+    };
+
+    // Handle window resize
+    window.addEventListener('resize', () => {
+        chartInstance.resize();
+    });
+
+    // SPATIAL ZOOM: Keyboard shortcuts
+    document.addEventListener('keydown', (e) => {
+        if (e.target.matches('input, textarea')) return;
+
+        // Spatial zoom shortcuts for heatmap mode
+        if (currentView === 'treemap' && treemapMode === 'heatmap') {
+            if (e.key === '-' || e.key === '_') {
+                e.preventDefault();
+                console.log(`[Spatial Zoom] Keyboard zoom out`);
+                spatialZoomOut();
+            }
+        }
+
+        if (e.key === 'Backspace') {
+            e.preventDefault();
+            // In the unified treemap, Backspace should act like a zoom out.
+            if (currentView === 'treemap') {
+                 const isRoot = currentPath.endsWith(':\\') && currentPath.length === 3;
+                 if (currentPath && !isRoot) {
+                    let parentPath = currentPath.substring(0, currentPath.lastIndexOf('\\'));
+                    if (!parentPath.includes('\\')) parentPath += '\\';
+                    
+                    // FIX: Call the unified treemap request function.
+                    currentZoom = 1.0;
+                    requestTreemapView(parentPath, currentZoom);
+                 }
+            } else if (currentView === 'sunburst') {
+                // Sunburst logic remains the same
+                const isRoot = currentPath.endsWith(':\\') && currentPath.length === 3;
+                 if (currentPath && !isRoot) {
+                    let parentPath = currentPath.substring(0, currentPath.lastIndexOf('\\'));
+                    if (!parentPath.includes('\\')) parentPath += '\\';
+                    pywebview.api.get_sunburst_adaptive_view(parentPath, 4).then(data => {
+                       if (data) renderView(data, true); // Use renderView
+                    });
+                 }
+            }
+        }
+
+        if (e.key === 'ArrowLeft' && e.altKey) {
+            e.preventDefault();
+            if (navStack.length > 1) {
+                navStack.pop(); // Remove current state
+                const previousData = navStack[navStack.length - 1]; // Get previous state
+                if (previousData) {
+                    // FIX: Call the main renderView function, which dispatches correctly.
+                    renderView(previousData, true);
+                }
+            }
+        }
+
+        if (e.key === 'Escape') {
+            e.preventDefault();
+            resetViewButton.click();
+        }
+
+        if (e.key === 'Tab' && !e.shiftKey && !e.ctrlKey) {
+            e.preventDefault();
+            chartToggle.checked = !chartToggle.checked;
+            chartToggle.dispatchEvent(new Event('change'));
+        }
+    });
+
+    // Initialize the application
+    viewportSize = getViewportSize();
+    statusBar.textContent = 'Ready. Select a drive and click Scan or Load Cache.';
+    
+    console.log('[Init] Spatial zoom implementation ready. Switch to Heatmap Mode and scroll over folders to zoom IN.');
+});
