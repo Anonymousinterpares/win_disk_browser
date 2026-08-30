@@ -3,6 +3,7 @@ window.addEventListener('pywebviewready', function() {
     const driveSelect = document.getElementById('drive-select');
     const scanButton = document.getElementById('scan-button');
     const cacheButton = document.getElementById('cache-button');
+    const liveMonitorToggle = document.getElementById('live-monitor-toggle');
     const chartToggle = document.getElementById('chart-toggle');
     const chartContainer = document.getElementById('chart-container');
     const statusBar = document.getElementById('status-bar');
@@ -97,6 +98,16 @@ window.addEventListener('pywebviewready', function() {
     let aggregationData = new Map(); 
     let currentRootPath = '';
     let isRefreshingLive = false;
+    let liveMonitorEnabled = false;
+
+    function syncLiveMonitoring() {
+        if (!currentRootPath || !pywebview.api) return;
+        if (liveMonitorEnabled) {
+            pywebview.api.start_live_updates(currentRootPath);
+        } else {
+            pywebview.api.stop_live_updates();
+        }
+    }
     // --- HELPER FUNCTIONS ---
     function formatSize(bytes) {
         if (bytes === 0) return '0 B';
@@ -1364,6 +1375,9 @@ chartContainer.addEventListener('wheel', function(event) {
         pywebview.api.set_viewport && pywebview.api.set_viewport(viewportSize.width, viewportSize.height);
         
         isQuickPreview = false;
+        if (pywebview.api.stop_live_updates) {
+            pywebview.api.stop_live_updates();
+        }
         try {
             pywebview.api.start_scan(selectedDrive);
         } catch (error) {
@@ -1371,6 +1385,18 @@ chartContainer.addEventListener('wheel', function(event) {
             window.onScanFailed('Failed to start scan: ' + (error.message || error));
         }
     });
+
+    if (liveMonitorToggle) {
+        liveMonitorToggle.addEventListener('change', () => {
+            liveMonitorEnabled = liveMonitorToggle.checked;
+            syncLiveMonitoring();
+            if (liveMonitorEnabled) {
+                statusBar.textContent = 'Live monitoring enabled.';
+            } else {
+                statusBar.textContent = 'Live monitoring disabled.';
+            }
+        });
+    }
 
     // Cache button
     cacheButton.addEventListener('click', () => {
@@ -1398,6 +1424,10 @@ chartContainer.addEventListener('wheel', function(event) {
         viewportSize = getViewportSize();
         if (pywebview.api.set_viewport) {
             pywebview.api.set_viewport(viewportSize.width, viewportSize.height);
+        }
+
+        if (pywebview.api.stop_live_updates) {
+            pywebview.api.stop_live_updates();
         }
         
         try {
@@ -2818,10 +2848,11 @@ chartToggle.addEventListener('change', () => {
             // Always start in TreeView (the default mode)
             setTreemapMode('treeview');
             renderView(data);
-            statusBar.textContent = `Cache loaded. Monitoring for live changes...`;
+            statusBar.textContent = 'Cache loaded.';
 
-            // Automatically start live monitoring
-            pywebview.api.start_live_updates(currentRootPath);
+            if (liveMonitorEnabled) {
+                syncLiveMonitoring();
+            }
 
         } else {
             onCacheMiss(); // If data is null, it's a cache miss
@@ -2849,10 +2880,11 @@ chartToggle.addEventListener('change', () => {
                 
                 setTreemapMode('structure');
                 renderView(data);
-                statusBar.textContent = `Scan complete. Monitoring for live changes...`;
-                
-                // Automatically start live monitoring
-                pywebview.api.start_live_updates(currentRootPath);
+                statusBar.textContent = 'Scan complete.';
+
+                if (liveMonitorEnabled) {
+                    syncLiveMonitoring();
+                }
 
             } else {
                 statusBar.textContent = 'Scan completed but failed to retrieve final data.';

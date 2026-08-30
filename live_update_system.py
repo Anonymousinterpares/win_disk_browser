@@ -355,19 +355,9 @@ class LiveUpdateManager:
         """
         logging.info(f"Live data change detected, notifying UI about: {changed_paths}")
         
-        # Save changes to cache in background
-        def save_cache_background():
-            try:
-                if self.scanner.root_node:
-                    logging.debug("Saving live updates to cache...")
-                    last_usn = self.scanner.get_current_usn(self.scanner.root_node.path)
-                    self.scanner.save_to_cache(self.scanner.root_node, last_usn)
-                    logging.debug("Live updates saved to cache successfully")
-            except Exception as e:
-                logging.error(f"Failed to save live updates to cache: {e}")
-        
-        # Start background cache save
-        threading.Thread(target=save_cache_background, daemon=True).start()
+        # Save changes to cache (debounced to reduce disk I/O)
+        if self.scanner.root_node:
+            self.scanner.cache_saver.schedule_save(self.scanner.root_node)
         
         # Notify UI callback if provided
         if self.ui_callback:

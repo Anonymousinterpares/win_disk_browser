@@ -60,6 +60,7 @@ BATCH_SIZE = 500  # Smaller batches for more frequent updates
 CACHE_SIZE = 50000  # Reasonable cache size
 PROGRESS_UPDATE_INTERVAL = 0.1  # Update UI every 100ms
 MAX_DEPTH = 20  # Maximum recursion depth
+CACHE_SAVE_DEBOUNCE_SEC = 30.0  # Debounce live-update cache writes
 
 # Directories to skip for performance (but still count their size)
 SKIP_DIRS_SCAN = {
@@ -111,6 +112,30 @@ class FileNode:
         # Propagate up to parent
         if self.parent:
             self.parent.invalidate_size_cache()
+
+    @staticmethod
+    def finalize_dir_size(node: 'FileNode') -> int:
+        """Bottom-up size aggregation; stores result in _calculated_size."""
+        if not node.is_dir:
+            node._calculated_size = node.size
+            return node.size
+        if node._calculated_size is not None:
+            return node._calculated_size
+        total = node.size
+        for child in node.children:
+            if child.is_dir:
+                total += FileNode.finalize_dir_size(child)
+            else:
+                child._calculated_size = child.size
+                total += child.size
+        node._calculated_size = total
+        return total
+
+    @staticmethod
+    def ensure_tree_sizes(root: Optional['FileNode']) -> None:
+        """Precompute folder sizes for an entire tree (e.g. after cache load)."""
+        if root and root._calculated_size is None:
+            FileNode.finalize_dir_size(root)
     
     def to_dict(self) -> dict:
         """Convert to dictionary for serialization"""
@@ -149,6 +174,53 @@ class FileNode:
         return node
 
 
+class DebouncedCacheSaver:
+    """Coalesces frequent cache writes from live filesystem updates."""
+
+    def __init__(self, scanner: 'FixedDiskScanner', debounce_sec: float = CACHE_SAVE_DEBOUNCE_SEC):
+        self.scanner = scanner
+        self.debounce_sec = debounce_sec
+        self._lock = threading.Lock()
+        self._timer: Optional[threading.Timer] = None
+        self._pending_root: Optional[FileNode] = None
+        self._pending_usn: Optional[int] = None
+
+    def schedule_save(self, root_node: FileNode, usn: Optional[int] = None) -> None:
+        with self._lock:
+            self._pending_root = root_node
+            if usn is not None:
+                self._pending_usn = usn
+            if self._timer is not None:
+                self._timer.cancel()
+            self._timer = threading.Timer(self.debounce_sec, self._flush)
+            self._timer.daemon = True
+            self._timer.start()
+
+    def _flush(self) -> None:
+        with self._lock:
+            root = self._pending_root
+            usn = self._pending_usn
+            self._pending_root = None
+            self._pending_usn = None
+            self._timer = None
+        if not root:
+            return
+        try:
+            if usn is None:
+                usn = self.scanner.get_current_usn(root.path)
+            self.scanner.save_to_cache(root, usn)
+            logging.info("Debounced cache save completed")
+        except Exception as e:
+            logging.error(f"Debounced cache save failed: {e}")
+
+    def flush_now(self) -> None:
+        with self._lock:
+            if self._timer is not None:
+                self._timer.cancel()
+                self._timer = None
+        self._flush()
+
+
 class FixedDiskScanner:
     """Fixed disk scanner with proper size calculation and caching"""
     
@@ -159,6 +231,7 @@ class FixedDiskScanner:
         self.processed_items = 0
         self.last_update_time = 0
         self.event_queue = queue.Queue()
+        self.cache_saver = DebouncedCacheSaver(self)
         
         # Initialize database
         self.init_database()
@@ -232,6 +305,7 @@ class FixedDiskScanner:
             root_node = self._scan_directory_recursive(path)
             
             if root_node:
+                FileNode.finalize_dir_size(root_node)
                 scan_time = time.time() - start_time
                 total_size = root_node.get_size()
                 

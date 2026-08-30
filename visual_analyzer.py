@@ -23,6 +23,7 @@ import time
 import subprocess
 import platform
 import ctypes
+import atexit
 
 # Import shared live update system with fallback
 try:
@@ -91,6 +92,7 @@ logging.info(f"Log file: {LOG_FILE_PATH}")
 DATABASE_PATH = os.path.join(APP_DATA_DIR, 'disk_cache_fixed.db')
 scanner = FixedDiskScanner(db_path=DATABASE_PATH)
 logging.info(f"Database file: {DATABASE_PATH}")
+atexit.register(scanner.cache_saver.flush_now)
 
 
 from watchdog.observers import Observer
@@ -350,6 +352,9 @@ class Api:
         self._current_zoom = 1.0
         self._view_cache = {}
         self._initial_pruned_data = None
+        self._top_list_cache: Dict[str, Optional[List[dict]]] = {'folders': None, 'files': None}
+        self._top_list_lock = threading.Lock()
+        self._top_list_build_thread: Optional[threading.Thread] = None
         
         # Initialize live update system (new shared system)
         if SHARED_LIVE_UPDATE_AVAILABLE:
@@ -365,6 +370,71 @@ class Api:
         self.event_queue = queue.Queue()
         self.live_update_thread = None
         self._stop_live_updates_flag = threading.Event()
+
+    def _set_scan_result(self, root_node: Optional[FileNode], warm_indexes: bool = True) -> None:
+        """Store scan data and optionally warm derived indexes (sizes, top-list)."""
+        self._scan_result_root = root_node
+        if root_node:
+            FileNode.ensure_tree_sizes(root_node)
+            if warm_indexes:
+                self._invalidate_top_list_cache()
+                self._schedule_top_list_index_build()
+
+    def _invalidate_top_list_cache(self) -> None:
+        with self._top_list_lock:
+            self._top_list_cache = {'folders': None, 'files': None}
+
+    def _schedule_top_list_index_build(self) -> None:
+        if not self._scan_result_root:
+            return
+        if self._top_list_build_thread and self._top_list_build_thread.is_alive():
+            return
+
+        def build_worker():
+            try:
+                self._build_top_list_index()
+            except Exception as e:
+                logging.error(f"Top list index build failed: {e}", exc_info=True)
+
+        self._top_list_build_thread = threading.Thread(target=build_worker, daemon=True)
+        self._top_list_build_thread.start()
+
+    def _build_top_list_index(self) -> None:
+        if not self._scan_result_root:
+            return
+        start_time = time.time()
+        root_path = self._scan_result_root.path
+        all_nodes = self._flatten_tree_nodes(self._scan_result_root)
+
+        folders: List[dict] = []
+        files: List[dict] = []
+        for node in all_nodes:
+            if node.is_dir and node.path != root_path:
+                folders.append({
+                    'name': node.name,
+                    'path': node.path,
+                    'value': node.get_size(),
+                    'is_dir': True,
+                })
+            elif not node.is_dir:
+                files.append({
+                    'name': node.name,
+                    'path': node.path,
+                    'value': node.size,
+                    'is_dir': False,
+                })
+
+        folders.sort(key=lambda item: item['value'], reverse=True)
+        files.sort(key=lambda item: item['value'], reverse=True)
+
+        with self._top_list_lock:
+            self._top_list_cache = {'folders': folders, 'files': files}
+
+        elapsed = time.time() - start_time
+        logging.info(
+            f"Top list index built in {elapsed:.2f}s "
+            f"({len(folders)} folders, {len(files)} files)"
+        )
         
     def set_viewport(self, width: int, height: int):
         """Update viewport dimensions for LOD calculations."""
@@ -674,7 +744,7 @@ class Api:
 
                 if root_node:
                     # Store the complete scan result in the API object. This is now the source of truth.
-                    self._scan_result_root = root_node
+                    self._set_scan_result(root_node)
                     logging.info("Full scan complete. Notifying frontend to pull final data.")
                     
                     # --- FIX: Send a simple notification, not the whole dataset ---
@@ -749,7 +819,7 @@ class Api:
                 logging.warning(f"Permission denied for quick scan of {path}")
             
             # Send quick preview
-            self._scan_result_root = quick_root
+            self._set_scan_result(quick_root, warm_indexes=False)
             preview_data = self.get_structure_view(path) # START IN STRUCTURE MODE
             if preview_data:
                 # Ensure preview data has proper structure
@@ -800,7 +870,7 @@ class Api:
 
             if root_node:
                 logging.info("Scan/Refresh successful, building initial view.")
-                self._scan_result_root = root_node
+                self._set_scan_result(root_node)
                 initial_lod = self.get_structure_view(path)
                 
                 if initial_lod:
@@ -826,6 +896,8 @@ class Api:
         """
         try:
             logging.info(f"Live data changed via shared system: {len(changed_paths)} paths affected")
+            self._invalidate_top_list_cache()
+            self._schedule_top_list_index_build()
             
             # Notify JavaScript about the live updates
             # Re-use existing JavaScript callback mechanism
@@ -1116,18 +1188,11 @@ class Api:
             return
         
         logging.info(f"Live data change detected. Notifying frontend about: {changed_parent_dirs}")
-        
-        def save_cache_in_background():
-            try:
-                if self._scan_result_root:
-                    logging.info("Saving live updates to cache database...")
-                    new_usn = scanner.get_current_usn(self._scan_result_root.path)
-                    scanner.save_to_cache(self._scan_result_root, new_usn)
-                    logging.info("Live updates successfully saved to cache.")
-            except Exception as e:
-                logging.error(f"Failed to save live updates to cache: {e}", exc_info=True)
-        
-        threading.Thread(target=save_cache_in_background, daemon=True).start()
+        self._invalidate_top_list_cache()
+        self._schedule_top_list_index_build()
+
+        if self._scan_result_root:
+            scanner.cache_saver.schedule_save(self._scan_result_root)
 
         try:
             unique_parents = list(set(changed_parent_dirs))
@@ -1247,44 +1312,29 @@ class Api:
     def get_largest_consumers(self, consumer_type: str, offset: int = 0, limit: int = 50):
         """
         Gets a sorted, paginated list of the largest files or folders.
+        Uses a pre-built index when available (built once after scan/cache load).
         """
         if not self._scan_result_root:
             return {'items': [], 'total': 0}
 
         logging.info(f"Fetching largest consumers: type={consumer_type}, offset={offset}, limit={limit}")
 
-        # Flatten the entire tree to get all nodes
-        all_nodes = self._flatten_tree_nodes(self._scan_result_root)
+        with self._top_list_lock:
+            consumers = self._top_list_cache.get(consumer_type)
 
-        if consumer_type == 'folders':
-            # Filter for directories, excluding the root itself
-            consumers = [node for node in all_nodes if node.is_dir and node.path != self._scan_result_root.path]
-            # Sort by total size, descending
-            consumers.sort(key=lambda n: n.get_size(), reverse=True)
-        elif consumer_type == 'files':
-            # Filter for files
-            consumers = [node for node in all_nodes if not node.is_dir]
-            # Sort by individual file size, descending
-            consumers.sort(key=lambda n: n.size, reverse=True)
-        else:
-            return {'items': [], 'total': 0}
+        if consumers is None:
+            if self._top_list_build_thread and self._top_list_build_thread.is_alive():
+                self._top_list_build_thread.join(timeout=120.0)
+            with self._top_list_lock:
+                consumers = self._top_list_cache.get(consumer_type)
+            if consumers is None:
+                self._build_top_list_index()
+                with self._top_list_lock:
+                    consumers = self._top_list_cache.get(consumer_type) or []
 
         total_count = len(consumers)
-        
-        # Get the requested slice (page) of data
-        paginated_consumers = consumers[offset : offset + limit]
-
-        # Format the data for the frontend
-        results = []
-        for node in paginated_consumers:
-            results.append({
-                'name': node.name,
-                'path': node.path,
-                'value': node.get_size() if consumer_type == 'folders' else node.size,
-                'is_dir': node.is_dir
-            })
-
-        return {'items': results, 'total': total_count}
+        paginated = consumers[offset: offset + limit]
+        return {'items': paginated, 'total': total_count}
     
     
     

@@ -42,6 +42,22 @@ html, body {
 .toolbar button:hover { background-color: var(--primary-color); }
 .toolbar button:disabled { background-color: #444; cursor: not-allowed; }
 
+.live-monitor-toggle {
+    display: flex;
+    align-items: center;
+    gap: 6px;
+    margin-left: 10px;
+    margin-right: 4px;
+    font-size: 0.9em;
+    cursor: pointer;
+    user-select: none;
+    white-space: nowrap;
+}
+
+.live-monitor-toggle input {
+    cursor: pointer;
+}
+
 .icon-button {
     font-size: 1.2em;
     padding: 4px 8px;
