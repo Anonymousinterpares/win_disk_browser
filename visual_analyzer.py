@@ -1299,80 +1299,116 @@ class Api:
             size /= 1024.0
         return f"{size:.1f} PB"
     
-    def get_directory_tree(self, path: str = None) -> Dict:
-        """Get directory-only tree structure (Windows Explorer style)"""
+    def _build_lazy_folder_nodes(self, parent_node: FileNode) -> List[dict]:
+        """Build one jsTree level — immediate subdirectories only."""
+        subdirs = [child for child in parent_node.children if child.is_dir]
+        nodes = []
+        for subdir in sorted(subdirs, key=lambda x: x.name.lower()):
+            has_subdirs = any(child.is_dir for child in subdir.children)
+            node = {
+                "id": subdir.path,
+                "text": subdir.name,
+                "type": "folder",
+                "data": {
+                    "path": subdir.path,
+                    "is_dir": True,
+                },
+            }
+            if has_subdirs:
+                node["children"] = True
+            nodes.append(node)
+        return nodes
+
+    def _resolve_tree_node(self, path: str = None) -> Optional[FileNode]:
+        if not self._scan_result_root:
+            return None
+        if not path or path == self._scan_result_root.path:
+            return self._scan_result_root
+        return self._find_node_by_path(path)
+
+    def get_directory_tree_root(self, path: str = None) -> Dict:
+        """Return the scan root as a single lazy jsTree node (no full-tree walk)."""
         try:
-            if not self._scan_result_root:
+            root_node = self._resolve_tree_node(path)
+            if not root_node:
                 return {"error": "No data loaded"}
-                
-            root_node = self._scan_result_root
-            if path and path != root_node.path:
-                root_node = self._find_node_by_path(path)
-                if not root_node:
-                    return {"error": f"Path not found: {path}"}
-            
-            logging.info(f"Building directory tree for: {root_node.path}")
+
             start_time = time.time()
-            
-            def build_directory_tree(node: FileNode, level: int = 0) -> Dict:
-                """Build tree with directories only (no files)"""
-                dir_data = {
-                    "text": node.name or node.path,
-                    "type": "drive" if level == 0 else "folder",
-                    "state": {"opened": level == 0},
-                    "data": {
-                        "path": node.path,
-                        "is_dir": True,
-                        "level": level
-                    }
-                }
-                
-                # Find subdirectories only
-                subdirs = [child for child in node.children if child.is_dir]
-                
-                if subdirs:
-                    children = []
-                    # Sort directories by name for consistency
-                    sorted_dirs = sorted(subdirs, key=lambda x: x.name.lower())
-                    
-                    for subdir in sorted_dirs:
-                        child_tree = build_directory_tree(subdir, level + 1)
-                        if child_tree:
-                            children.append(child_tree)
-                    
-                    if children:
-                        dir_data["children"] = children
-                
-                return dir_data
-            
-            tree_data = build_directory_tree(root_node)
-            
+            is_drive_root = len(root_node.path) <= 3 and root_node.path[1:2] == ':'
+            has_subdirs = any(child.is_dir for child in root_node.children)
+            node = {
+                "id": root_node.path,
+                "text": root_node.name or root_node.path,
+                "type": "drive" if is_drive_root else "folder",
+                "data": {
+                    "path": root_node.path,
+                    "is_dir": True,
+                },
+            }
+            if has_subdirs:
+                node["children"] = True
+
+            child_count = sum(1 for child in root_node.children if child.is_dir)
             elapsed = time.time() - start_time
-            
-            # Count directories
-            def count_directories(node):
-                count = 1
-                if isinstance(node, dict) and "children" in node:
-                    for child in node["children"]:
-                        count += count_directories(child)
-                return count
-            
-            dir_count = count_directories(tree_data)
-            logging.info(f"Directory tree built in {elapsed:.2f}s - {dir_count} directories")
-            
+            logging.info(
+                f"Lazy tree root for {root_node.path} in {elapsed:.3f}s "
+                f"({child_count} immediate folders)"
+            )
             return {
                 "success": True,
-                "data": tree_data,
+                "node": node,
                 "stats": {
-                    "directories": dir_count,
+                    "root_path": root_node.path,
+                    "child_count": child_count,
                     "load_time": elapsed,
-                    "root_path": root_node.path
-                }
+                },
             }
-            
         except Exception as e:
-            logging.error(f"Error building directory tree: {e}")
+            logging.error(f"Error building lazy tree root: {e}")
             return {"error": str(e)}
+
+    def get_directory_tree_children(self, parent_path: str) -> Dict:
+        """Return immediate subdirectory children for lazy jsTree expansion."""
+        try:
+            parent_node = self._resolve_tree_node(parent_path)
+            if not parent_node:
+                return {"error": f"Path not found: {parent_path}"}
+            if not parent_node.is_dir:
+                return {"error": f"Path is not a directory: {parent_path}"}
+
+            start_time = time.time()
+            nodes = self._build_lazy_folder_nodes(parent_node)
+            elapsed = time.time() - start_time
+            logging.info(
+                f"Lazy tree children for {parent_path}: {len(nodes)} folders in {elapsed:.3f}s"
+            )
+            return {
+                "success": True,
+                "nodes": nodes,
+                "stats": {
+                    "parent_path": parent_path,
+                    "child_count": len(nodes),
+                    "load_time": elapsed,
+                },
+            }
+        except Exception as e:
+            logging.error(f"Error building lazy tree children for {parent_path}: {e}")
+            return {"error": str(e)}
+
+    def get_directory_tree(self, path: str = None) -> Dict:
+        """Backward-compatible alias: returns lazy root node only."""
+        result = self.get_directory_tree_root(path)
+        if result.get("error"):
+            return result
+        return {
+            "success": True,
+            "data": result["node"],
+            "stats": {
+                "directories": result["stats"]["child_count"] + 1,
+                "load_time": result["stats"]["load_time"],
+                "root_path": result["stats"]["root_path"],
+            },
+        }
     
     def get_directory_contents(self, path: str) -> Dict:
         """Get files and folders in a specific directory (Windows Explorer style)"""
@@ -1500,20 +1536,18 @@ def main():
         try:
             target_path = auto_load_path
             
-            # If no specific path provided, try to find a cached drive
+            # If no specific path provided, find a cached drive (metadata only — no pickle load)
             if not target_path:
-                drives = api.get_drives()
-                if drives:
-                    # Try each drive to see if cache exists
-                    for drive in drives:
-                        try:
-                            cached_data = scanner.load_from_cache(drive)
-                            if cached_data:
-                                target_path = drive
-                                logging.info(f"Found cached data for drive: {drive}")
-                                break
-                        except:
-                            continue
+                cached_drives = scanner.list_cached_drives()
+                if cached_drives:
+                    target_path = cached_drives[0]
+                    logging.info(f"Found cached data for drive: {target_path}")
+                else:
+                    for drive in api.get_drives():
+                        if scanner.cache_exists(drive):
+                            target_path = drive
+                            logging.info(f"Found cached data for drive: {drive}")
+                            break
             
             if target_path:
                 logging.info(f"Auto-loading cache for: {target_path}")

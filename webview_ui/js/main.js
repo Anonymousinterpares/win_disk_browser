@@ -32,7 +32,7 @@ window.addEventListener('pywebviewready', function() {
     const navForwardBtn = document.getElementById('nav-forward-btn');
 
     // --- DEBUGGING CONFIGURATION ---
-    const DEBUG_TREEVIEW = true; // Set to false to disable TreeView debugging
+    const DEBUG_TREEVIEW = false; // Set to true to enable TreeView debugging
     const treeViewDebug = {
         log: (...args) => { if (DEBUG_TREEVIEW) console.log('[TreeView DEBUG]', ...args); },
         error: (...args) => { if (DEBUG_TREEVIEW) console.error('[TreeView ERROR]', ...args); },
@@ -363,7 +363,9 @@ window.addEventListener('pywebviewready', function() {
     window.addEventListener('resize', debounce(() => {
         viewportSize = getViewportSize();
         chartInstance.resize();
-        
+        if (pywebview.api.set_viewport) {
+            pywebview.api.set_viewport(viewportSize.width, viewportSize.height);
+        }
     }, 250));
 
     // --- API REQUEST FUNCTIONS ---
@@ -1484,70 +1486,113 @@ chartToggle.addEventListener('change', () => {
         }
     }
 
-    // --- WINDOWS EXPLORER STYLE TREEVIEW ---
+    // --- WINDOWS EXPLORER STYLE TREEVIEW (lazy-loaded) ---
     let currentDirectoryPath = '';
-    
+
+    function getParentPath(path) {
+        if (!path) return null;
+        if (path.length === 3 && path[1] === ':' && path[2] === '\\') return null;
+        const lastSlash = path.lastIndexOf('\\');
+        if (lastSlash <= 0) return null;
+        let parent = path.substring(0, lastSlash);
+        if (parent.length === 2 && parent[1] === ':') parent += '\\';
+        return parent;
+    }
+
+    function fetchTreeChildren(parentPath) {
+        return pywebview.api.get_directory_tree_children(parentPath).then(response => {
+            if (response.error) {
+                throw new Error(response.error);
+            }
+            return response.nodes || [];
+        });
+    }
+
     function requestTreeView(path) {
         statusBar.textContent = `Loading Windows Explorer view for ${path}...`;
-        
-        // Load directory tree (left panel)
-        pywebview.api.get_directory_tree(path).then(response => {
+
+        const loadRoot = pywebview.api.get_directory_tree_root
+            ? pywebview.api.get_directory_tree_root(path)
+            : pywebview.api.get_directory_tree(path).then(response => ({
+                success: response.success,
+                node: response.data,
+                stats: {
+                    root_path: response.stats.root_path,
+                    child_count: Math.max(0, (response.stats.directories || 1) - 1),
+                },
+                error: response.error,
+            }));
+
+        loadRoot.then(response => {
             if (response.error) {
                 statusBar.textContent = `TreeView Error: ${response.error}`;
                 return;
             }
-            
-            renderDirectoryTree(response.data);
-            statusBar.textContent = `Directory tree loaded: ${response.stats.directories} folders`;
-            
-            // Load initial directory contents (right panel) - start with root
-            currentDirectoryPath = response.stats.root_path;
-            
-            // Initialize navigation history with root path
+
+            currentRootPath = response.stats.root_path;
+            renderDirectoryTreeLazy(response.node);
+
+            const childCount = response.stats.child_count ?? 0;
+            statusBar.textContent = `Folder tree ready (${childCount} top-level folders)`;
+
+            currentDirectoryPath = currentRootPath;
+
             if (navHistory.length === 0) {
-                navHistory = [response.stats.root_path];
+                navHistory = [currentRootPath];
                 navHistoryIndex = 0;
-                treeViewDebug.log('Initialized navigation history with root:', response.stats.root_path);
+                treeViewDebug.log('Initialized navigation history with root:', currentRootPath);
             }
-            
+
             loadDirectoryContents(currentDirectoryPath);
-            
-            // Ensure navigation buttons are visible and initialized
+
             setTimeout(() => {
                 updateNavigationButtons();
             }, 200);
-            
         }).catch(error => {
             console.error('Error loading TreeView:', error);
             statusBar.textContent = `TreeView Error: ${error.message}`;
         });
     }
-    
-    function renderDirectoryTree(treeData) {
-        // Destroy existing tree
+
+    function renderDirectoryTreeLazy(rootNode) {
         if ($(treeView).jstree(true)) {
+            $(treeView).off('select_node.jstree');
             $(treeView).jstree('destroy');
         }
-        
-        // Initialize jsTree with directory-only data (much smaller)
+
         $(treeView).jstree({
-            'core': {
-                'data': [treeData],
-                'check_callback': true,
-                'themes': {
-                    'name': 'default',
-                    'dots': true,
-                    'icons': true
+            core: {
+                data: function(node, callback) {
+                    if (node.id === '#') {
+                        callback([rootNode]);
+                        return;
+                    }
+                    const nodePath = node.data && node.data.path;
+                    if (!nodePath) {
+                        callback([]);
+                        return;
+                    }
+                    fetchTreeChildren(nodePath)
+                        .then(children => callback(children))
+                        .catch(err => {
+                            console.error('Failed to load tree children:', err);
+                            callback([]);
+                        });
+                },
+                check_callback: true,
+                themes: {
+                    name: 'default',
+                    dots: true,
+                    icons: true
                 }
             },
-            'types': {
-                'drive': { 'icon': 'jstree-folder' },
-                'folder': { 'icon': 'jstree-folder' }
+            types: {
+                drive: { icon: 'jstree-folder' },
+                folder: { icon: 'jstree-folder' }
             },
-            'plugins': ['types', 'search']
+            plugins: ['types', 'search']
         });
-        
-        // Directory selection handler - load contents when folder selected
+
         $(treeView).on('select_node.jstree', function(e, data) {
             const nodeData = data.node.data;
             if (nodeData && nodeData.path) {
@@ -1556,10 +1601,51 @@ chartToggle.addEventListener('change', () => {
                 statusBar.textContent = `Directory: ${nodeData.path}`;
             }
         });
-        
-        // Auto-expand root
-        $(treeView).on('ready.jstree', function() {
-            console.log('Directory tree ready');
+    }
+
+    function expandPathInTree(targetPath) {
+        return new Promise((resolve) => {
+            const tree = $(treeView).jstree(true);
+            if (!tree || !targetPath || !currentRootPath) {
+                resolve();
+                return;
+            }
+
+            const pathChain = [];
+            let cursor = targetPath;
+            while (cursor && cursor !== currentRootPath) {
+                pathChain.unshift(cursor);
+                cursor = getParentPath(cursor);
+            }
+
+            if (pathChain.length === 0) {
+                resolve();
+                return;
+            }
+
+            let index = 0;
+            const openNext = () => {
+                if (index >= pathChain.length) {
+                    resolve();
+                    return;
+                }
+                const nodePath = pathChain[index];
+                if (tree.get_node(nodePath)) {
+                    tree.open_node(nodePath, () => {
+                        index += 1;
+                        setTimeout(openNext, 0);
+                    });
+                } else {
+                    const parentPath = getParentPath(nodePath) || currentRootPath;
+                    tree.open_node(parentPath, () => {
+                        setTimeout(() => {
+                            index += 1;
+                            openNext();
+                        }, 50);
+                    });
+                }
+            };
+            openNext();
         });
     }
     
@@ -1989,67 +2075,48 @@ chartToggle.addEventListener('change', () => {
     }
     
     function selectTreeNodeByPath(path) {
-        // Skip tree selection if one is already in progress or during rapid operations
         if (treeViewOperationState.treeSelectionInProgress) {
             treeViewDebug.log('Tree selection already in progress, queuing:', path);
             treeViewOperationState.pendingTreeSelections.add(path);
             return;
         }
-        
-        // Skip if too many pending selections (rapid clicking)
+
         if (treeViewOperationState.pendingTreeSelections.size > 3) {
             treeViewDebug.log('Too many pending tree selections, skipping:', path);
             return;
         }
-        
+
         treeViewDebug.log('selectTreeNodeByPath called with path:', path);
-        treeViewDebug.time('selectTreeNodeByPath');
-        
         treeViewOperationState.treeSelectionInProgress = true;
-        
-        // Try to find and select the node in the tree
+
         const tree = $(treeView).jstree(true);
         if (!tree) {
             treeViewDebug.error('jsTree not initialized');
             treeViewOperationState.treeSelectionInProgress = false;
-            treeViewDebug.timeEnd('selectTreeNodeByPath');
             return;
         }
-        
-        // Add timeout protection for tree operations
-        const operationTimeout = setTimeout(() => {
-            treeViewDebug.error('Tree selection timeout for path:', path);
-            treeViewOperationState.treeSelectionInProgress = false;
-            treeViewDebug.timeEnd('selectTreeNodeByPath');
-            
-            // Process next pending selection if any
-            processNextTreeSelection();
-        }, 3000); // 3 second timeout
-        
-        // Use setTimeout to make tree operations async and prevent UI blocking
-        setTimeout(() => {
+
+        expandPathInTree(path).then(() => {
             try {
-                treeViewDebug.log('Starting async tree operations');
-                
-                // First deselect all nodes
-                treeViewDebug.time('Deselect All');
                 tree.deselect_all();
-                treeViewDebug.timeEnd('Deselect All');
-                
-                // Find node with matching path using async processing
-                treeViewDebug.time('Find Node');
-                findAndSelectTreeNode(tree, path, operationTimeout);
-                
+                if (tree.get_node(path)) {
+                    tree.select_node(path);
+                    const nodeElement = tree.get_node(path, true);
+                    if (nodeElement && nodeElement.length > 0) {
+                        nodeElement[0].scrollIntoView({ behavior: 'smooth', block: 'center' });
+                    }
+                }
             } catch (error) {
-                treeViewDebug.error('Error in async tree operations:', error);
-                clearTimeout(operationTimeout);
+                treeViewDebug.error('Error selecting tree node:', error);
+            } finally {
                 treeViewOperationState.treeSelectionInProgress = false;
-                treeViewDebug.timeEnd('selectTreeNodeByPath');
-                
-                // Process next pending selection if any
                 processNextTreeSelection();
             }
-        }, 0);
+        }).catch(error => {
+            treeViewDebug.error('Error expanding tree path:', error);
+            treeViewOperationState.treeSelectionInProgress = false;
+            processNextTreeSelection();
+        });
     }
     
     // Process the next pending tree selection
@@ -2063,131 +2130,6 @@ chartToggle.addEventListener('change', () => {
             
             treeViewDebug.log('Processing next pending tree selection:', nextPath);
             setTimeout(() => selectTreeNodeByPath(nextPath), 100);
-        }
-    }
-    
-    // Separate function for async tree node finding and selection
-    function findAndSelectTreeNode(tree, path, operationTimeout) {
-        try {
-            const allNodes = tree.get_json('#', { flat: true });
-            treeViewDebug.log('Searching through', allNodes.length, 'nodes for path:', path);
-            
-            let targetNode = null;
-            let nodeCount = 0;
-            
-            // Process nodes in chunks to prevent UI blocking
-            const processChunk = () => {
-                const chunkSize = 50; // Process 50 nodes at a time
-                const endIndex = Math.min(nodeCount + chunkSize, allNodes.length);
-                
-                for (let i = nodeCount; i < endIndex; i++) {
-                    const node = allNodes[i];
-                    if (node.data && node.data.path === path) {
-                        targetNode = node;
-                        break;
-                    }
-                }
-                
-                nodeCount = endIndex;
-                
-                if (targetNode) {
-                    // Found the target node
-                    treeViewDebug.timeEnd('Find Node');
-                    clearTimeout(operationTimeout);
-                    selectFoundTreeNode(tree, targetNode, path);
-                } else if (nodeCount < allNodes.length) {
-                    // More nodes to process, continue in next tick
-                    setTimeout(processChunk, 0);
-                } else {
-                    // Finished searching, node not found
-                    treeViewDebug.timeEnd('Find Node');
-                    treeViewDebug.log('Node not found for path:', path);
-                    clearTimeout(operationTimeout);
-                    treeViewOperationState.treeSelectionInProgress = false;
-                    treeViewDebug.timeEnd('selectTreeNodeByPath');
-                    
-                    // Process next pending selection if any
-                    processNextTreeSelection();
-                }
-            };
-            
-            processChunk();
-            
-        } catch (error) {
-            treeViewDebug.error('Error finding tree node:', error);
-            clearTimeout(operationTimeout);
-            treeViewOperationState.treeSelectionInProgress = false;
-            treeViewDebug.timeEnd('selectTreeNodeByPath');
-            
-            // Process next pending selection if any
-            processNextTreeSelection();
-        }
-    }
-    
-    // Function to select the found tree node
-    function selectFoundTreeNode(tree, targetNode, path) {
-        try {
-            treeViewDebug.log('Found target node:', targetNode.text);
-            
-            // Open all parent nodes to reveal the target
-            treeViewDebug.time('Tree Operations');
-            
-            // Use setTimeout for tree operations to prevent blocking
-            setTimeout(() => {
-                try {
-                    tree.open_node(targetNode.parent);
-                    
-                    setTimeout(() => {
-                        try {
-                            // Select the target node
-                            tree.select_node(targetNode.id);
-                            
-                            // Scroll to the selected node
-                            setTimeout(() => {
-                                try {
-                                    const nodeElement = tree.get_node(targetNode.id, true);
-                                    if (nodeElement && nodeElement.length > 0) {
-                                        nodeElement[0].scrollIntoView({ behavior: 'smooth', block: 'center' });
-                                    }
-                                    
-                                    treeViewDebug.timeEnd('Tree Operations');
-                                    treeViewDebug.log('Successfully selected node for path:', path);
-                                    treeViewOperationState.treeSelectionInProgress = false;
-                                    treeViewDebug.timeEnd('selectTreeNodeByPath');
-                                    
-                                    // Process next pending selection if any
-                                    processNextTreeSelection();
-                                } catch (error) {
-                                    treeViewDebug.error('Error scrolling to node:', error);
-                                    treeViewOperationState.treeSelectionInProgress = false;
-                                    treeViewDebug.timeEnd('selectTreeNodeByPath');
-                                    
-                                    // Process next pending selection if any
-                                    processNextTreeSelection();
-                                }
-                            }, 10);
-                            
-                        } catch (error) {
-                            treeViewDebug.error('Error selecting node:', error);
-                            treeViewOperationState.treeSelectionInProgress = false;
-                            treeViewDebug.timeEnd('selectTreeNodeByPath');
-                            processNextTreeSelection();
-                        }
-                    }, 10);
-                    
-                } catch (error) {
-                    treeViewDebug.error('Error opening parent node:', error);
-                    treeViewOperationState.treeSelectionInProgress = false;
-                    treeViewDebug.timeEnd('selectTreeNodeByPath');
-                    processNextTreeSelection();
-                }
-            }, 10);
-            
-        } catch (error) {
-            treeViewDebug.error('Error in selectFoundTreeNode:', error);
-            treeViewOperationState.treeSelectionInProgress = false;
-            treeViewDebug.timeEnd('selectTreeNodeByPath');
-            processNextTreeSelection();
         }
     }
     
@@ -2939,11 +2881,6 @@ chartToggle.addEventListener('change', () => {
         driveSelect.disabled = false;
         chartInstance.hideLoading();
     };
-
-    // Handle window resize
-    window.addEventListener('resize', () => {
-        chartInstance.resize();
-    });
 
     // SPATIAL ZOOM: Keyboard shortcuts
     document.addEventListener('keydown', (e) => {

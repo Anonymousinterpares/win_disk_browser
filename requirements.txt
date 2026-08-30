@@ -1,10 +1,9 @@
 # DiskInsight Pro - Requirements
 
 ## Core Requirements (Essential)
-customtkinter>=5.2.0  # Modern UI components
+pywebview>=4.0
+customtkinter>=5.2.0  # Legacy Tk UI (arch/)
 watchdog
-
-## Performance Optimizations (Highly Recommended)
 pywin32>=305  # Windows API for faster scanning
 # Install with: pip install pywin32
 

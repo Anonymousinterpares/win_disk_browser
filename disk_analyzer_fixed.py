@@ -394,16 +394,59 @@ class FixedDiskScanner:
         except Exception as e:
             logging.error(f"Cache save error: {e}")
     
+    def cache_exists(self, path: str) -> bool:
+        """Check if a cache entry exists without deserializing scan data."""
+        try:
+            normalized = os.path.abspath(path)
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.execute(
+                    'SELECT 1 FROM scan_cache WHERE drive = ? LIMIT 1',
+                    (normalized,)
+                )
+                if cursor.fetchone():
+                    return True
+                # Legacy rows may use alternate path forms (e.g. C:\ vs C:)
+                if len(normalized) >= 2 and normalized[1] == ':':
+                    alt = normalized.rstrip('\\') + '\\'
+                    if alt != normalized:
+                        cursor = conn.execute(
+                            'SELECT 1 FROM scan_cache WHERE drive = ? LIMIT 1',
+                            (alt,),
+                        )
+                        return cursor.fetchone() is not None
+        except Exception as e:
+            logging.error(f"Cache existence check error: {e}")
+        return False
+
+    def list_cached_drives(self) -> List[str]:
+        """Return drive paths that have cached scan data (metadata only)."""
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                cursor = conn.execute('SELECT drive FROM scan_cache ORDER BY timestamp DESC')
+                return [row[0] for row in cursor.fetchall()]
+        except Exception as e:
+            logging.error(f"Cache list error: {e}")
+            return []
+
     def load_from_cache(self, path: str) -> Optional[FileNode]:
         """Load scan results from cache"""
         try:
+            normalized = os.path.abspath(path)
             with sqlite3.connect(self.db_path) as conn:
                 cursor = conn.execute(
                     'SELECT data FROM scan_cache WHERE drive = ?',
-                    (path,)
+                    (normalized,)
                 )
                 result = cursor.fetchone()
-                
+                if not result and len(normalized) >= 2 and normalized[1] == ':':
+                    alt = normalized.rstrip('\\') + '\\'
+                    if alt != normalized:
+                        cursor = conn.execute(
+                            'SELECT data FROM scan_cache WHERE drive = ?',
+                            (alt,),
+                        )
+                        result = cursor.fetchone()
+
                 if result:
                     return pickle.loads(result[0])
                     
