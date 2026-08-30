@@ -663,3 +663,77 @@ input:checked + .slider:before { transform: translateX(26px); }
     background-color: transparent !important;
     width: 18px;
 }
+
+/* Scan / cache progress overlay */
+.scan-progress-overlay {
+    position: fixed;
+    inset: 0;
+    background: rgba(10, 10, 18, 0.92);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    z-index: 10000;
+}
+
+.scan-progress-overlay[hidden] {
+    display: none !important;
+}
+
+.scan-progress-panel {
+    width: min(520px, 90vw);
+    padding: 28px 32px;
+    background: #2a2a38;
+    border: 1px solid #444;
+    border-radius: 10px;
+    box-shadow: 0 12px 40px rgba(0, 0, 0, 0.45);
+    text-align: center;
+}
+
+.scan-progress-panel h2 {
+    margin: 0 0 20px;
+    font-size: 1.25rem;
+    font-weight: 600;
+    color: #f5f5f5;
+}
+
+.scan-progress-bar-track {
+    height: 10px;
+    background: #1a1a24;
+    border-radius: 5px;
+    overflow: hidden;
+    margin-bottom: 16px;
+}
+
+.scan-progress-bar-fill {
+    height: 100%;
+    width: 0%;
+    background: linear-gradient(90deg, #005a9e, #0078d4, #00a4ef);
+    border-radius: 5px;
+    transition: width 0.35s ease;
+}
+
+.scan-progress-bar-fill.indeterminate {
+    width: 35%;
+    animation: scan-progress-slide 1.4s ease-in-out infinite;
+}
+
+@keyframes scan-progress-slide {
+    0% { transform: translateX(-120%); }
+    100% { transform: translateX(420%); }
+}
+
+#scan-progress-status {
+    margin: 0 0 8px;
+    font-size: 0.95rem;
+    color: #e0e0e0;
+}
+
+.scan-progress-detail {
+    margin: 0;
+    font-size: 0.8rem;
+    color: #999;
+    word-break: break-all;
+    line-height: 1.35;
+    max-height: 3.2em;
+    overflow: hidden;
+}

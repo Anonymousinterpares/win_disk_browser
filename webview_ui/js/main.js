@@ -31,6 +31,11 @@ window.addEventListener('pywebviewready', function() {
     const collapseAllBtn = document.getElementById('collapse-all-btn');
     const navBackBtn = document.getElementById('nav-back-btn');
     const navForwardBtn = document.getElementById('nav-forward-btn');
+    const scanProgressOverlay = document.getElementById('scan-progress-overlay');
+    const scanProgressTitle = document.getElementById('scan-progress-title');
+    const scanProgressBar = document.getElementById('scan-progress-bar');
+    const scanProgressStatus = document.getElementById('scan-progress-status');
+    const scanProgressDetail = document.getElementById('scan-progress-detail');
 
     // --- DEBUGGING CONFIGURATION ---
     const DEBUG_TREEVIEW = false; // Set to true to enable TreeView debugging
@@ -99,6 +104,156 @@ window.addEventListener('pywebviewready', function() {
     let currentRootPath = '';
     let isRefreshingLive = false;
     let liveMonitorEnabled = false;
+    let currentDatasetGeneration = 0;
+    let fullScanInProgress = false;
+    let activeOperation = null;
+
+    function acceptDatasetPayload(data) {
+        if (!data || data._datasetGeneration == null) {
+            return true;
+        }
+        if (data._datasetGeneration !== currentDatasetGeneration) {
+            console.log(
+                `Ignoring stale dataset #${data._datasetGeneration} (current #${currentDatasetGeneration})`
+            );
+            return false;
+        }
+        return true;
+    }
+
+    function setControlsEnabled(enabled) {
+        scanButton.disabled = !enabled;
+        cacheButton.disabled = !enabled;
+        driveSelect.disabled = !enabled;
+    }
+
+    function truncatePath(path, maxLen = 88) {
+        if (!path) return '';
+        if (path.length <= maxLen) return path;
+        return '…' + path.slice(-(maxLen - 1));
+    }
+
+    function itemsToProgressPercent(itemsScanned) {
+        if (!itemsScanned || itemsScanned <= 0) return null;
+        return Math.min(92, 12 * Math.log10(itemsScanned + 1));
+    }
+
+    function clearViewForOperation() {
+        chartInstance.clear();
+        chartInstance.hideLoading();
+        breadcrumbContainer.textContent = '';
+        resetViewButton.style.display = 'none';
+        if ($(treeView).jstree(true)) {
+            $(treeView).off('select_node.jstree');
+            $(treeView).jstree('destroy');
+        }
+        treeView.innerHTML = '';
+        const fileListContainer = document.getElementById('file-list');
+        if (fileListContainer) {
+            fileListContainer.innerHTML = '';
+        }
+        chartContainer.style.display = 'block';
+        treeviewContainer.style.display = 'none';
+    }
+
+    function showScanProgress(title, statusText) {
+        if (!scanProgressOverlay) return;
+        scanProgressTitle.textContent = title || 'Working…';
+        scanProgressStatus.textContent = statusText || 'Starting…';
+        scanProgressDetail.textContent = '';
+        scanProgressBar.classList.add('indeterminate');
+        scanProgressBar.style.width = '';
+        scanProgressOverlay.hidden = false;
+    }
+
+    function updateScanProgress(payload) {
+        if (!scanProgressOverlay || scanProgressOverlay.hidden) return;
+        if (!acceptDatasetPayload(payload)) return;
+
+        const operation = payload.operation || activeOperation || 'scan';
+        const itemsScanned = payload.itemsScanned || 0;
+        const currentPath = payload.path || '';
+
+        if (payload.message) {
+            scanProgressStatus.textContent = payload.message;
+        } else if (operation === 'cache') {
+            scanProgressStatus.textContent = itemsScanned > 0
+                ? `Refreshing cache — ${itemsScanned.toLocaleString()} items processed`
+                : 'Loading from cache…';
+        } else {
+            scanProgressStatus.textContent = itemsScanned > 0
+                ? `Scanning — ${itemsScanned.toLocaleString()} items processed`
+                : 'Scanning disk…';
+        }
+
+        if (currentPath) {
+            scanProgressDetail.textContent = truncatePath(currentPath);
+        }
+
+        const percent = itemsToProgressPercent(itemsScanned);
+        if (percent != null) {
+            scanProgressBar.classList.remove('indeterminate');
+            scanProgressBar.style.width = `${percent}%`;
+        }
+    }
+
+    function hideScanProgress() {
+        if (!scanProgressOverlay) return;
+        scanProgressOverlay.hidden = true;
+        scanProgressBar.classList.add('indeterminate');
+        scanProgressBar.style.width = '';
+        activeOperation = null;
+    }
+
+    function beginLongOperation(path, operation, title) {
+        activeOperation = operation;
+        fullScanInProgress = true;
+        isQuickPreview = false;
+        clearViewForOperation();
+        showScanProgress(
+            title || (operation === 'cache' ? 'Loading from cache' : 'Scanning disk'),
+            operation === 'cache' ? `Loading cache for ${path}…` : `Scanning ${path}…`
+        );
+        setControlsEnabled(false);
+        statusBar.textContent = operation === 'cache'
+            ? `Loading cache for ${path}…`
+            : `Scanning ${path}…`;
+    }
+
+    function setOperationBusy(busy) {
+        fullScanInProgress = busy;
+        if (!busy) {
+            chartInstance.hideLoading();
+            hideScanProgress();
+        }
+    }
+
+    function refreshActiveView(data) {
+        if (!data) return;
+
+        const path = data.path || currentRootPath;
+        currentRootPath = path;
+        currentPath = path;
+        updateBreadcrumb(path);
+        resetViewButton.style.display = 'block';
+        resetViewButton.title = 'Reset to root view (Esc key)';
+
+        if (currentView === 'treemap') {
+            if (treemapMode === 'treeview') {
+                requestTreeView(path);
+            } else if (treemapMode === 'toplist') {
+                requestTopListView();
+            } else {
+                renderView(data);
+            }
+        } else {
+            pywebview.api.get_sunburst_adaptive_view(path, 4).then(sunburstData => {
+                if (sunburstData && acceptDatasetPayload(sunburstData)) {
+                    renderEnhancedSunburst(sunburstData, false);
+                }
+            });
+        }
+    }
 
     function syncLiveMonitoring() {
         if (!currentRootPath || !pywebview.api) return;
@@ -359,17 +514,39 @@ window.addEventListener('pywebviewready', function() {
     }
 
     // --- API COMMUNICATION ---
-    pywebview.api.get_drives().then(drives => {
-        drives.forEach(drive => {
-            const option = document.createElement('option');
-            option.value = drive;
-            option.textContent = drive;
-            driveSelect.appendChild(option);
+    function refreshDriveList() {
+        const api = pywebview.api.get_drive_cache_status
+            ? pywebview.api.get_drive_cache_status()
+            : pywebview.api.get_drives().then(drives =>
+                drives.map(drive => ({ drive, has_cache: false }))
+            );
+
+        return api.then(drives => {
+            const previous = driveSelect.value;
+            driveSelect.innerHTML = '';
+            drives.forEach(({ drive, has_cache }) => {
+                const option = document.createElement('option');
+                option.value = drive;
+                option.textContent = has_cache ? `${drive} (cached)` : drive;
+                driveSelect.appendChild(option);
+            });
+            if (previous && [...driveSelect.options].some(o => o.value === previous)) {
+                driveSelect.value = previous;
+            }
+            const cachedCount = drives.filter(d => d.has_cache).length;
+            if (cachedCount > 0) {
+                statusBar.textContent =
+                    `Ready. ${cachedCount} cached drive(s) — select one and click Load from Cache or Scan.`;
+            } else {
+                statusBar.textContent = 'Ready. Select a drive and click Scan Fresh.';
+            }
+        }).catch(error => {
+            console.error('Error loading drives:', error);
+            statusBar.textContent = 'Error loading drives';
         });
-    }).catch(error => {
-        console.error('Error getting drives:', error);
-        statusBar.textContent = 'Error loading drives';
-    });
+    }
+    window.refreshDriveList = refreshDriveList;
+    refreshDriveList();
 
     window.addEventListener('resize', debounce(() => {
         viewportSize = getViewportSize();
@@ -1361,25 +1538,20 @@ chartContainer.addEventListener('wheel', function(event) {
         navStack = [];
         aggregationData.clear();
         
-        statusBar.textContent = `Scanning ${selectedDrive}...`;
-        scanButton.disabled = true;
-        cacheButton.disabled = true;
-        driveSelect.disabled = true;
-        chartInstance.showLoading({
-            text: 'Scanning disk...',
-            color: '#0078d4',
-            maskColor: 'rgba(0, 0, 0, 0.8)'
-        });
+        beginLongOperation(selectedDrive, 'scan', 'Scanning disk');
         
         viewportSize = getViewportSize();
         pywebview.api.set_viewport && pywebview.api.set_viewport(viewportSize.width, viewportSize.height);
         
-        isQuickPreview = false;
         if (pywebview.api.stop_live_updates) {
             pywebview.api.stop_live_updates();
         }
         try {
-            pywebview.api.start_scan(selectedDrive);
+            pywebview.api.start_scan(selectedDrive).then(generation => {
+                if (generation) {
+                    currentDatasetGeneration = generation;
+                }
+            });
         } catch (error) {
             console.error('Error starting scan:', error);
             window.onScanFailed('Failed to start scan: ' + (error.message || error));
@@ -1410,15 +1582,7 @@ chartContainer.addEventListener('wheel', function(event) {
         navStack = [];
         aggregationData.clear();
         
-        statusBar.textContent = `Loading cache for ${selectedDrive}...`;
-        scanButton.disabled = true;
-        cacheButton.disabled = true;
-        driveSelect.disabled = true;
-        chartInstance.showLoading({
-            text: 'Loading from cache...',
-            color: '#0078d4',
-            maskColor: 'rgba(0, 0, 0, 0.8)'
-        });
+        beginLongOperation(selectedDrive, 'cache', 'Loading from cache');
         cacheButton.textContent = 'Load from Cache';
 
         viewportSize = getViewportSize();
@@ -1431,7 +1595,11 @@ chartContainer.addEventListener('wheel', function(event) {
         }
         
         try {
-            pywebview.api.load_from_cache(selectedDrive);
+            pywebview.api.load_from_cache(selectedDrive, true, false).then(generation => {
+                if (generation) {
+                    currentDatasetGeneration = generation;
+                }
+            });
         } catch (error) {
             console.error('Cache load error:', error);
             window.onScanFailed('Cache load error: ' + (error.message || error));
@@ -2810,44 +2978,45 @@ chartToggle.addEventListener('change', () => {
     };
 
         
-    window.onQuickPreview = function(data) {
-        console.log('Quick preview received:', data);
-        isQuickPreview = true;
-        chartInstance.hideLoading();
-        chartInstance.showLoading({
-            text: 'Quick preview loaded. Full scan in progress...',
-            color: '#00aa00',
-            maskColor: 'rgba(0, 0, 0, 0.5)'
-        });
-        
-        if (data) {
-            if (!data.children || !Array.isArray(data.children)) {
-                data.children = [];
-            }
-            currentPath = data.path;
-            currentRootPath = data.path;
-            renderView(data);
-            statusBar.textContent = 'Quick preview ready. Full scan continuing...';
+    window.onScanProgress = function(payload) {
+        if (!payload) return;
+        if (payload._datasetGeneration != null) {
+            currentDatasetGeneration = payload._datasetGeneration;
         }
+        if (!acceptDatasetPayload(payload)) return;
+
+        if (payload.started && scanProgressOverlay && scanProgressOverlay.hidden) {
+            const operation = payload.operation || 'cache';
+            const path = payload.path || payload._datasetPath || '';
+            beginLongOperation(
+                path,
+                operation,
+                operation === 'scan' ? 'Scanning disk' : 'Loading from cache'
+            );
+        }
+        updateScanProgress(payload);
+    };
+
+    window.onQuickPreview = function(data) {
+        // Quick preview disabled — incomplete data is misleading on long scans.
+        if (!acceptDatasetPayload(data)) return;
+        console.log('Quick preview suppressed; waiting for full scan.');
     };
 
     window.onScanComplete = function(data) {
         console.log('Scan/Cache load complete:', data);
+        if (!acceptDatasetPayload(data)) return;
+
         navStack = [];
         currentZoom = 1.0;
+        fullScanInProgress = false;
         
+        hideScanProgress();
         chartInstance.hideLoading();
-        scanButton.disabled = false;
-        cacheButton.disabled = false;
-        driveSelect.disabled = false;
+        setControlsEnabled(true);
         
         if (data) {
-            currentRootPath = data.path;
-            currentPath = data.path;
-            
-            // Always start in TreeView (the default mode)
-            setTreemapMode('treeview');
-            renderView(data);
+            refreshActiveView(data);
             statusBar.textContent = 'Cache loaded.';
 
             if (liveMonitorEnabled) {
@@ -2855,31 +3024,39 @@ chartToggle.addEventListener('change', () => {
             }
 
         } else {
-            onCacheMiss(); // If data is null, it's a cache miss
+            onCacheMiss();
         }
         isQuickPreview = false;
     };
 
-    window.onScanFinallyComplete = function() {
+    window.onScanFinallyComplete = function(generation) {
         console.log("Backend signaled full scan is complete. Now pulling final data...");
-        statusBar.textContent = 'Scan complete. Fetching final data...';
+        if (typeof generation === 'number' && generation !== currentDatasetGeneration) {
+            console.log(`Ignoring stale onScanFinallyComplete for dataset #${generation}`);
+            return;
+        }
+
+        if (scanProgressBar) {
+            scanProgressBar.classList.remove('indeterminate');
+            scanProgressBar.style.width = '100%';
+        }
+        scanProgressStatus.textContent = 'Finalizing view…';
+        statusBar.textContent = 'Scan complete. Preparing view…';
         
-        pywebview.api.get_final_scan_data().then(data => {
+        pywebview.api.get_final_scan_data(currentDatasetGeneration).then(data => {
             console.log('Final scan data received:', data);
+            if (!acceptDatasetPayload(data)) return;
+
             navStack = [];
             currentZoom = 1.0;
+            fullScanInProgress = false;
             
+            hideScanProgress();
             chartInstance.hideLoading();
-            scanButton.disabled = false;
-            cacheButton.disabled = false;
-            driveSelect.disabled = false;
+            setControlsEnabled(true);
             
             if (data) {
-                currentRootPath = data.path;
-                currentPath = data.path;
-                
-                setTreemapMode('structure');
-                renderView(data);
+                refreshActiveView(data);
                 statusBar.textContent = 'Scan complete.';
 
                 if (liveMonitorEnabled) {
@@ -2896,21 +3073,29 @@ chartToggle.addEventListener('change', () => {
         });
     };
 
-    window.onCacheMiss = function() {
+    window.onCacheMiss = function(generation) {
+        if (typeof generation === 'number' && generation !== currentDatasetGeneration) {
+            return;
+        }
         statusBar.textContent = 'No cache found. Please perform a fresh scan.';
-        scanButton.disabled = false;
-        cacheButton.disabled = false;
-        driveSelect.disabled = false;
+        fullScanInProgress = false;
+        hideScanProgress();
+        setControlsEnabled(true);
         chartInstance.hideLoading();
     };
 
-    // In function onScanFailed():
     window.onScanFailed = function(message = 'Scan failed. Please check permissions.') {
+        if (message && typeof message === 'object') {
+            if (message._datasetGeneration != null && message._datasetGeneration !== currentDatasetGeneration) {
+                return;
+            }
+            message = message.message || 'Scan failed. Please check permissions.';
+        }
         console.error('Scan failed:', message);
         statusBar.textContent = message;
-        scanButton.disabled = false;
-        cacheButton.disabled = false;
-        driveSelect.disabled = false;
+        fullScanInProgress = false;
+        hideScanProgress();
+        setControlsEnabled(true);
         chartInstance.hideLoading();
     };
 

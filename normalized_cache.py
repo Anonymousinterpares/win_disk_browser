@@ -12,6 +12,14 @@ CACHE_FORMAT_PICKLE = 1
 CACHE_FORMAT_NORMALIZED = 2
 
 
+def _configure_cache_connection(conn: sqlite3.Connection, *, write: bool = False) -> None:
+    conn.execute('PRAGMA journal_mode=WAL')
+    conn.execute('PRAGMA synchronous=NORMAL' if write else 'PRAGMA synchronous=OFF')
+    conn.execute('PRAGMA temp_store=MEMORY')
+    conn.execute('PRAGMA mmap_size=268435456')
+    conn.execute('PRAGMA cache_size=-64000')
+
+
 def ensure_cache_schema(conn: sqlite3.Connection) -> None:
     conn.execute(
         '''
@@ -109,6 +117,7 @@ def save_normalized_tree(
 
 
 def load_normalized_tree(conn: sqlite3.Connection, drive: str) -> Optional[Any]:
+    _configure_cache_connection(conn)
     cursor = conn.execute(
         '''
         SELECT path, parent_path, name, size, is_dir, mtime, file_count, dir_count
@@ -136,6 +145,8 @@ def load_normalized_tree(conn: sqlite3.Connection, drive: str) -> Optional[Any]:
             file_count=file_count or 0,
             dir_count=dir_count or 0,
         )
+        # Sizes were aggregated at save time — skip full-tree recomputation on load.
+        node._calculated_size = size
         nodes[path] = node
         if parent_path is None or path == drive:
             root = node
@@ -146,10 +157,6 @@ def load_normalized_tree(conn: sqlite3.Connection, drive: str) -> Optional[Any]:
             parent = nodes[parent_path]
             child.parent = parent
             parent.children.append(child)
-
-    for node in nodes.values():
-        if node.is_dir:
-            node.children.sort(key=lambda child: child.name.lower())
 
     return root
 

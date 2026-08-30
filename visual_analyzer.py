@@ -355,6 +355,12 @@ class Api:
         self._top_list_cache: Dict[str, Optional[List[dict]]] = {'folders': None, 'files': None}
         self._top_list_lock = threading.Lock()
         self._top_list_build_thread: Optional[threading.Thread] = None
+        self._top_list_generation = 0
+        self._dataset_generation = 0
+        self._dataset_path: Optional[str] = None
+        self._suppress_auto_load = threading.Event()
+        self._structure_view_cache: Dict[str, Tuple[dict, float]] = {}
+        self._STRUCTURE_CACHE_TTL_SEC = 120.0
         
         # Initialize live update system (new shared system)
         if SHARED_LIVE_UPDATE_AVAILABLE:
@@ -370,6 +376,84 @@ class Api:
         self.event_queue = queue.Queue()
         self.live_update_thread = None
         self._stop_live_updates_flag = threading.Event()
+
+    @staticmethod
+    def _normalize_path(path: str) -> str:
+        if not path:
+            return path
+        normalized = os.path.normpath(path)
+        if len(normalized) == 2 and normalized[1] == ':':
+            return normalized + '\\'
+        return normalized
+
+    def _begin_dataset(self, path: str, user_initiated: bool = True) -> int:
+        """Start a new dataset session; invalidates in-flight loads/scans from other sessions."""
+        if user_initiated:
+            self._suppress_auto_load.set()
+        self._dataset_generation += 1
+        generation = self._dataset_generation
+        self._dataset_path = self._normalize_path(os.path.abspath(path))
+        self._scan_result_root = None
+        self._initial_pruned_data = None
+        self._structure_view_cache.clear()
+        self._top_list_generation = generation
+        self._invalidate_top_list_cache()
+        logging.info(f"Dataset #{generation} started for {self._dataset_path}")
+        return generation
+
+    def _dataset_snapshot(self, generation: int) -> bool:
+        return generation == self._dataset_generation
+
+    def _attach_dataset_meta(self, payload: dict, generation: Optional[int] = None) -> dict:
+        data = dict(payload)
+        data['_datasetGeneration'] = generation if generation is not None else self._dataset_generation
+        if self._dataset_path:
+            data['_datasetPath'] = self._dataset_path
+        return data
+
+    def _notify_js(self, callback: str, payload: Optional[dict] = None, generation: Optional[int] = None) -> None:
+        gen = generation if generation is not None else self._dataset_generation
+        try:
+            if payload is not None:
+                window.evaluate_js(f'{callback}({json.dumps(self._attach_dataset_meta(payload, gen))})')
+            else:
+                window.evaluate_js(f'{callback}({gen})')
+        except Exception as e:
+            logging.error(f"Failed to notify frontend via {callback}: {e}")
+
+    def _run_with_progress(self, generation: int, operation: str, fn):
+        """Run a scanner operation and stream folder/item progress to the UI."""
+        def progress_callback(current_path: str, items_scanned: int) -> None:
+            if not self._dataset_snapshot(generation):
+                return
+            self._notify_js(
+                'onScanProgress',
+                {
+                    'operation': operation,
+                    'path': current_path,
+                    'itemsScanned': items_scanned,
+                },
+                generation,
+            )
+
+        scanner.set_progress_callback(progress_callback)
+        try:
+            return fn()
+        finally:
+            scanner.set_progress_callback(None)
+
+    def _notify_scan_started(self, generation: int, operation: str, path: str, message: str) -> None:
+        self._notify_js(
+            'onScanProgress',
+            {
+                'operation': operation,
+                'path': path,
+                'itemsScanned': 0,
+                'message': message,
+                'started': True,
+            },
+            generation,
+        )
 
     def _set_scan_result(self, root_node: Optional[FileNode], warm_indexes: bool = True) -> None:
         """Store scan data and optionally warm derived indexes (sizes, top-list)."""
@@ -387,20 +471,23 @@ class Api:
     def _schedule_top_list_index_build(self) -> None:
         if not self._scan_result_root:
             return
-        if self._top_list_build_thread and self._top_list_build_thread.is_alive():
-            return
+
+        generation = self._top_list_generation
 
         def build_worker():
             try:
-                self._build_top_list_index()
+                self._build_top_list_index(generation)
             except Exception as e:
                 logging.error(f"Top list index build failed: {e}", exc_info=True)
 
         self._top_list_build_thread = threading.Thread(target=build_worker, daemon=True)
         self._top_list_build_thread.start()
 
-    def _build_top_list_index(self) -> None:
+    def _build_top_list_index(self, generation: int) -> None:
         if not self._scan_result_root:
+            return
+        if generation != self._top_list_generation:
+            logging.info("Skipping stale top-list index build")
             return
         start_time = time.time()
         root_path = self._scan_result_root.path
@@ -427,6 +514,10 @@ class Api:
         folders.sort(key=lambda item: item['value'], reverse=True)
         files.sort(key=lambda item: item['value'], reverse=True)
 
+        if generation != self._top_list_generation:
+            logging.info("Discarding stale top-list index result")
+            return
+
         with self._top_list_lock:
             self._top_list_cache = {'folders': folders, 'files': files}
 
@@ -445,7 +536,7 @@ class Api:
         
         logging.info(f"Viewport updated to ({width}, {height})")
         self._viewport_size = (width, height)
-        self._view_cache.clear()  # Clear cache when viewport changes
+        self._structure_view_cache.clear()
         
     def get_drives(self):
         """Returns a list of available drives."""
@@ -487,15 +578,20 @@ class Api:
             logging.warning(f"Node not found for path: {path}")
             return None
 
+        cache_key = f"{self._normalize_path(path)}|{zoom:.3f}|{self._viewport_size[0]}x{self._viewport_size[1]}"
+        cached = self._structure_view_cache.get(cache_key)
+        if cached:
+            structure_data, cached_at = cached
+            if time.time() - cached_at < self._STRUCTURE_CACHE_TTL_SEC:
+                return structure_data
+
         try:
-            # Use the adaptive LOD system to get dynamic aggregation based on zoom
-            # This brings the "heatmap" aggregation intelligence into the structure view
             structure_data = self.lod_system.build_lod_tree(
                 node, 
                 self._viewport_size, 
                 zoom
             )
-            
+            self._structure_view_cache[cache_key] = (structure_data, time.time())
             return structure_data
         except Exception as e:
             logging.error(f"Error generating structure view for {path}: {e}", exc_info=True)
@@ -720,76 +816,93 @@ class Api:
         data['children'] = children_data
         return data
     
-    def start_scan(self, path):
-        """Start a scan with progressive updates."""
-        # Return immediately to avoid blocking
-        def scan_wrapper():
-            self._start_scan_impl(path)
-        threading.Thread(target=scan_wrapper).start()
-        return None  # Don't return a promise
+    def start_scan(self, path: str) -> int:
+        """Start a scan with progressive updates. Returns dataset generation id."""
+        generation = self._begin_dataset(path)
+        threading.Thread(
+            target=self._start_scan_impl,
+            args=(path, generation),
+            daemon=True,
+        ).start()
+        return generation
 
-    def _start_scan_impl(self, path):
+    def _start_scan_impl(self, path: str, generation: int):
         """Implementation of scan with robust frontend communication."""
-        def scan_thread_target(path):
+        scan_path = self._normalize_path(os.path.abspath(path))
+
+        def scan_thread_target():
             try:
-                logging.info(f"Starting progressive scan of {path}")
-                
-                # --- Quick Scan ---
-                # This part remains the same.
-                self._quick_scan(path)
-                
-                # --- Full Scan ---
-                # This performs the long, blocking scan.
-                root_node = scanner.scan_directory(path, use_cache=False)
+                logging.info(f"Starting full scan of {scan_path} (dataset #{generation})")
+                self._notify_scan_started(
+                    generation,
+                    'scan',
+                    scan_path,
+                    f'Scanning {scan_path}…',
+                )
+
+                root_node = self._run_with_progress(
+                    generation,
+                    'scan',
+                    lambda: scanner.scan_directory(scan_path, use_cache=False),
+                )
+                if not self._dataset_snapshot(generation):
+                    logging.info(f"Scan #{generation} cancelled after full scan")
+                    return
 
                 if root_node:
-                    # Store the complete scan result in the API object. This is now the source of truth.
                     self._set_scan_result(root_node)
                     logging.info("Full scan complete. Notifying frontend to pull final data.")
-                    
-                    # --- FIX: Send a simple notification, not the whole dataset ---
-                    # This is a small, lightweight message that is much more likely to succeed.
-                    window.evaluate_js('onScanFinallyComplete()')
+                    self._notify_js('onScanFinallyComplete', generation=generation)
                 else:
-                    # If the full scan fails, notify the frontend.
-                    window.evaluate_js('onScanFailed("Full scan returned no data")')
+                    self._notify_js('onScanFailed', {'message': 'Full scan returned no data'}, generation)
 
             except Exception as e:
                 logging.error(f"Scan error: {e}", exc_info=True)
-                window.evaluate_js('onScanFailed("An error occurred during the full scan.")')
-        
-        scan_thread = threading.Thread(target=scan_thread_target, args=(path,))
-        scan_thread.start()
+                self._notify_js(
+                    'onScanFailed',
+                    {'message': 'An error occurred during the full scan.'},
+                    generation,
+                )
 
-    def get_final_scan_data(self):
+        threading.Thread(target=scan_thread_target, daemon=True).start()
+
+    def get_final_scan_data(self, generation: int = 0):
         """Called by the frontend after it receives the onScanFinallyComplete signal."""
+        if generation and not self._dataset_snapshot(generation):
+            logging.warning(f"Ignoring stale get_final_scan_data for dataset #{generation}")
+            return None
+
         logging.info("Frontend requested final scan data")
         
         if not self._scan_result_root:
             logging.error("Frontend requested final data, but scan result root is None")
             return None
         
-        # Log scan result details for debugging
         root_size = self._scan_result_root.get_size()
         child_count = len(self._scan_result_root.children) if self._scan_result_root.children else 0
-        logging.info(f"Scan data available: root={self._scan_result_root.path}, size={root_size}, children={child_count}")
-        logging.info(f"Current viewport: {self._viewport_size}")
+        logging.info(
+            f"Scan data available: root={self._scan_result_root.path}, "
+            f"size={root_size}, children={child_count}"
+        )
         
         try:
-            # Generate the view from the fully scanned and stored root node.
             result = self.get_structure_view(self._scan_result_root.path)
             if result:
+                self._initial_pruned_data = deepcopy(result)
                 logging.info("Successfully generated final scan structure view")
-            else:
-                logging.error("get_structure_view returned None for final scan data")
-            return result
+                return self._attach_dataset_meta(result, generation or self._dataset_generation)
+            logging.error("get_structure_view returned None for final scan data")
+            return None
         except Exception as e:
             logging.error(f"Error generating final scan data: {e}", exc_info=True)
             return None
 
-    def _quick_scan(self, path: str):
+    def _quick_scan(self, path: str, generation: int):
         """Perform a quick shallow scan for immediate feedback."""
+        if not self._dataset_snapshot(generation):
+            return
         try:
+            path = self._normalize_path(os.path.abspath(path))
             quick_root = FileNode(path=path, name=os.path.basename(path) or path, is_dir=True)
             
             # Quick scan - only immediate children
@@ -818,14 +931,15 @@ class Api:
             except PermissionError:
                 logging.warning(f"Permission denied for quick scan of {path}")
             
-            # Send quick preview
+            if not self._dataset_snapshot(generation):
+                return
+
             self._set_scan_result(quick_root, warm_indexes=False)
-            preview_data = self.get_structure_view(path) # START IN STRUCTURE MODE
-            if preview_data:
-                # Ensure preview data has proper structure
+            preview_data = self.get_structure_view(path)
+            if preview_data and self._dataset_snapshot(generation):
                 if 'children' not in preview_data:
                     preview_data['children'] = []
-                window.evaluate_js(f'onQuickPreview({json.dumps(preview_data)})')
+                self._notify_js('onQuickPreview', preview_data, generation)
             
         except Exception as e:
             logging.error(f"Quick scan error: {e}")
@@ -841,53 +955,103 @@ class Api:
             pass
         return total
     
-    def load_from_cache(self, path):
-        """Load from cache with LOD view."""
-        # Return immediately and process in thread
-        def load_wrapper():
-            self._load_from_cache_impl(path)
-        threading.Thread(target=load_wrapper).start()
-        return None  # Don't return a promise
+    def get_drive_cache_status(self) -> List[dict]:
+        """List available drives and whether a local cache exists (metadata only)."""
+        cached = set(scanner.list_cached_drives())
+        status = []
+        for drive in self.get_drives():
+            has_cache = drive in cached or scanner.cache_exists(drive)
+            status.append({'drive': drive, 'has_cache': has_cache})
+        return status
 
-    def _load_from_cache_impl(self, path):
+    def _make_lazy_dataset_payload(self, root_node: FileNode, generation: int) -> dict:
+        """Minimal payload for TreeView-first UI — avoids building LOD structure on load."""
+        return self._attach_dataset_meta(
+            {
+                'path': root_node.path,
+                'name': root_node.name or root_node.path,
+                'value': root_node.get_size(),
+                'is_dir': True,
+                'children': [],
+                '_lazyLoad': True,
+            },
+            generation,
+        )
+
+    def load_from_cache(
+        self,
+        path: str,
+        user_initiated: bool = True,
+        refresh: bool = False,
+    ) -> Optional[int]:
+        """Load from cache. Set refresh=True to run USN journal update (slow)."""
+        if not user_initiated and self._suppress_auto_load.is_set():
+            logging.info("Auto cache load skipped — user operation already in progress")
+            return None
+        generation = self._begin_dataset(path, user_initiated=user_initiated)
+        threading.Thread(
+            target=self._load_from_cache_impl,
+            args=(path, generation, refresh),
+            daemon=True,
+        ).start()
+        return generation
+
+    def refresh_cache(self, path: str) -> Optional[int]:
+        """Explicit slow path: load cache then apply USN journal changes."""
+        return self.load_from_cache(path, user_initiated=True, refresh=True)
+
+    def _load_from_cache_impl(self, path: str, generation: int, refresh: bool = False):
         """
-        Implementation of cache loading, now with an administrator check
-        to decide whether to use the fast USN Journal refresh.
+        Load cached scan data. Default is instant hydration from SQLite only.
+        USN refresh is opt-in because it can trigger minutes-long rescans.
         """
+        if not self._dataset_snapshot(generation):
+            logging.info(f"Skipping stale cache load for dataset #{generation}")
+            return
+
+        path = self._normalize_path(os.path.abspath(path))
         try:
-            # --- START OF THE CRITICAL FIX ---
-            if is_admin():
-                logging.info(f"Admin rights detected. Attempting USN Journal refresh for: {path}")
-                # The scanner performs the USN operation and RETURNS a result.
-                root_node = scanner.refresh_from_cache(path)
+            load_start = time.time()
+            self._notify_scan_started(
+                generation,
+                'cache',
+                path,
+                f'Reading cache for {path}…',
+            )
+
+            if refresh and is_admin():
+                logging.info(f"Explicit USN refresh requested for: {path}")
+                root_node = self._run_with_progress(
+                    generation,
+                    'cache',
+                    lambda: scanner.refresh_from_cache(path),
+                )
             else:
-                logging.warning("No admin rights. Falling back to a full scan for refresh.")
-                # Inform the user why it will be slow.
-                window.evaluate_js('onScanFailed("Admin rights needed for fast refresh. Performing full scan...")')
-                # Perform a regular, slow scan as a fallback.
-                root_node = scanner.scan_directory(path)
-            # --- END OF THE CRITICAL FIX ---
+                if refresh and not is_admin():
+                    logging.warning("USN refresh skipped — admin rights required")
+                root_node = scanner.load_from_cache(path)
+
+            if not self._dataset_snapshot(generation):
+                logging.info(f"Discarding cache load result for stale dataset #{generation}")
+                return
 
             if root_node:
-                logging.info("Scan/Refresh successful, building initial view.")
-                self._set_scan_result(root_node)
-                initial_lod = self.get_structure_view(path)
-                
-                if initial_lod:
-                    if 'children' not in initial_lod:
-                        initial_lod['children'] = []
-                    self._initial_pruned_data = deepcopy(initial_lod)
-                    window.evaluate_js(f'onScanComplete({json.dumps(initial_lod)})')
-                else:
-                    logging.warning("Scan/Refresh resulted in a valid but empty node.")
-                    window.evaluate_js('onCacheMiss()')
+                load_elapsed = time.time() - load_start
+                logging.info(f"Cache hydrated in {load_elapsed:.2f}s, preparing UI.")
+                self._set_scan_result(root_node, warm_indexes=False)
+                payload = self._make_lazy_dataset_payload(root_node, generation)
+                self._notify_js('onScanComplete', payload, generation)
             else:
-                logging.error("The scan/refresh operation returned None.")
-                window.evaluate_js('onScanFailed("Scan or refresh operation failed.")')
+                logging.error("Cache load returned None.")
+                self._notify_js('onCacheMiss', generation=generation)
 
         except Exception as e:
             logging.error(f"CRITICAL FAILURE in _load_from_cache_impl: {e}", exc_info=True)
-            window.evaluate_js('onScanFailed("Cache refresh error. Check analyzer.log for details.")')
+            self._notify_js(
+                'onScanFailed',
+                {'message': 'Cache load error. Check analyzer.log for details.'},
+                generation,
+            )
     
     def _on_live_data_changed(self, changed_paths):
         """
@@ -1012,15 +1176,27 @@ class Api:
     
     def _find_node_by_path(self, path: str) -> Optional[FileNode]:
         """Find a node by path within the API's own root_node."""
-        if not self._scan_result_root or not path.startswith(self._scan_result_root.path):
+        if not self._scan_result_root or not path:
             return None
-        
+
+        target = self._normalize_path(path)
+        root_path = self._normalize_path(self._scan_result_root.path)
+
+        def paths_match(a: str, b: str) -> bool:
+            if os.name == 'nt':
+                return a.lower() == b.lower()
+            return a == b
+
+        if not paths_match(target, root_path) and not target.startswith(root_path.rstrip('\\') + '\\'):
+            if os.name != 'nt' or not target.lower().startswith(root_path.rstrip('\\').lower() + '\\'):
+                return None
+
         q = deque([self._scan_result_root])
         while q:
             current = q.popleft()
-            if current.path == path:
+            if paths_match(self._normalize_path(current.path), target):
                 return current
-            if path.startswith(current.path):
+            if current.is_dir:
                 for child in current.children:
                     q.append(child)
         return None
@@ -1323,12 +1499,13 @@ class Api:
             consumers = self._top_list_cache.get(consumer_type)
 
         if consumers is None:
+            generation = self._top_list_generation
             if self._top_list_build_thread and self._top_list_build_thread.is_alive():
                 self._top_list_build_thread.join(timeout=120.0)
             with self._top_list_lock:
                 consumers = self._top_list_cache.get(consumer_type)
             if consumers is None:
-                self._build_top_list_index()
+                self._build_top_list_index(generation)
                 with self._top_list_lock:
                     consumers = self._top_list_cache.get(consumer_type) or []
 
@@ -1578,51 +1755,21 @@ def main():
         # --- END OF FIX ---
     )
     
-    # Set up auto-loading - try specified path or detect available drives
+    # Startup: populate drive list only — never auto-load cache without user action.
     def on_window_ready():
-        # Give the window a moment to fully initialize
         import time
-        time.sleep(1)
+        time.sleep(0.3)
         try:
-            target_path = auto_load_path
-            
-            # If no specific path provided, find a cached drive (metadata only — no pickle load)
-            if not target_path:
-                cached_drives = scanner.list_cached_drives()
-                if cached_drives:
-                    target_path = cached_drives[0]
-                    logging.info(f"Found cached data for drive: {target_path}")
-                else:
-                    for drive in api.get_drives():
-                        if scanner.cache_exists(drive):
-                            target_path = drive
-                            logging.info(f"Found cached data for drive: {drive}")
-                            break
-            
-            if target_path:
-                logging.info(f"Auto-loading cache for: {target_path}")
-                api.load_from_cache(target_path)
+            if auto_load_path:
+                logging.info(f"CLI auto-load requested for: {auto_load_path}")
+                api.load_from_cache(auto_load_path, user_initiated=False, refresh=False)
             else:
-                logging.info("No cached data found - user will need to scan or load manually")
-                # Show popup asking if user wants to scan
-                def show_no_cache_popup():
-                    time.sleep(0.5)  # Brief delay to let UI fully load
-                    available_drives = api.get_drives()
-                    if available_drives:
-                        first_drive = available_drives[0]
-                        # Properly escape the drive path for JavaScript
-                        escaped_drive = json.dumps(first_drive)
-                        window.evaluate_js(f'''
-                            if (confirm("No cached data found. Would you like to perform a fresh scan of " + {escaped_drive} + "?")) {{
-                                pywebview.api.start_scan({escaped_drive});
-                            }}
-                        ''')
-                threading.Thread(target=show_no_cache_popup, daemon=True).start()
-                
+                window.evaluate_js(
+                    'if (typeof refreshDriveList === "function") { refreshDriveList(); }'
+                )
+                logging.info("Startup complete — waiting for user to select a drive")
         except Exception as e:
-            logging.error(f"Auto-load failed: {e}")
-    
-    # Always start auto-load (either with specified path or auto-detection)
+            logging.error(f"Startup failed: {e}")
     import threading
     threading.Thread(target=on_window_ready, daemon=True).start()
     

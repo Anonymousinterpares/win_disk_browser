@@ -95,7 +95,17 @@
             </div>
         </div>
 
-        <div id="status-bar">Ready. Select a drive and click Scan.</div>
+        <div id="status-bar">Ready. Select a drive and click Load from Cache or Scan Fresh.</div>
+    </div>
+    <div id="scan-progress-overlay" class="scan-progress-overlay" hidden>
+        <div class="scan-progress-panel">
+            <h2 id="scan-progress-title">Working…</h2>
+            <div class="scan-progress-bar-track">
+                <div id="scan-progress-bar" class="scan-progress-bar-fill indeterminate"></div>
+            </div>
+            <p id="scan-progress-status">Starting…</p>
+            <p id="scan-progress-detail" class="scan-progress-detail"></p>
+        </div>
     </div>
     <div id="context-menu" class="context-menu"></div>
     

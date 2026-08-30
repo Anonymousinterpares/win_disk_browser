@@ -61,6 +61,7 @@ from normalized_cache import (
     load_pickle_tree,
     get_cache_meta,
     has_normalized_cache,
+    _configure_cache_connection,
     CACHE_FORMAT_NORMALIZED,
 )
 from usn_journal import (
@@ -688,12 +689,18 @@ class FixedDiskScanner:
     def load_from_cache(self, path: str) -> Optional[FileNode]:
         """Load scan results from normalized cache, with pickle fallback + migration."""
         try:
+            start = time.time()
             with sqlite3.connect(self.db_path) as conn:
+                _configure_cache_connection(conn)
                 ensure_cache_schema(conn)
                 for key in self._resolve_drive_keys(path):
                     root = load_normalized_tree(conn, key)
                     if root:
-                        FileNode.ensure_tree_sizes(root)
+                        elapsed = time.time() - start
+                        logging.info(
+                            f"Loaded normalized cache for {key} in {elapsed:.2f}s "
+                            f"({len(root.children)} top-level entries)"
+                        )
                         return root
 
                     root = load_pickle_tree(conn, key)
