@@ -71,6 +71,7 @@ from usn_journal import (
     MAX_USN_PATHS_BEFORE_FULL_SCAN,
     UsnJournalState,
 )
+from mft_scanner import scan_drive_mft, can_use_mft_scan
 
 
 # Performance constants
@@ -81,6 +82,7 @@ PROGRESS_UPDATE_INTERVAL = 0.1  # Update UI every 100ms
 MAX_DEPTH = 20  # Maximum recursion depth
 CACHE_SAVE_DEBOUNCE_SEC = 30.0  # Debounce live-update cache writes
 USE_PARALLEL_SCAN = True  # Parallel BFS on Windows when pywin32 is available
+USE_MFT_SCAN = True  # NTFS MFT fast path when elevated (WizTree-class)
 
 # Legacy alias — extended skip list lives in windows_scanner.py
 
@@ -306,6 +308,10 @@ class FixedDiskScanner:
                 self.progress_callback(current_path, self.processed_items)
                 self.last_update_time = current_time
     
+    def _mft_progress(self, current_path: str, items_scanned: int) -> None:
+        self.processed_items = items_scanned
+        self.update_progress(current_path)
+
     def scan_directory(self, path: str, use_cache: bool = True) -> Optional[FileNode]:
         """
         Scan directory with proper error handling and caching
@@ -334,12 +340,17 @@ class FixedDiskScanner:
             # Reset counters
             self.processed_items = 0
             self.total_items = 0
-            
-            # Perform scan (parallel on Windows when available)
-            if USE_PARALLEL_SCAN and HAS_WIN32:
-                root_node = self._scan_directory_parallel(path)
-            else:
-                root_node = self._scan_directory_recursive(path)
+
+            root_node: Optional[FileNode] = None
+            if USE_MFT_SCAN and can_use_mft_scan(path):
+                logging.info(f"Attempting MFT fast scan for {path}")
+                root_node = scan_drive_mft(path, progress_callback=self._mft_progress)
+
+            if not root_node:
+                if USE_PARALLEL_SCAN and HAS_WIN32:
+                    root_node = self._scan_directory_parallel(path)
+                else:
+                    root_node = self._scan_directory_recursive(path)
             
             if root_node:
                 FileNode.finalize_dir_size(root_node)

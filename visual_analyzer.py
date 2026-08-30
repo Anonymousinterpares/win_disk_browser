@@ -837,7 +837,7 @@ class Api:
                     generation,
                     'scan',
                     scan_path,
-                    f'Scanning {scan_path}…',
+                    f'Scanning {scan_path} (MFT fast path when elevated)…',
                 )
 
                 root_node = self._run_with_progress(
