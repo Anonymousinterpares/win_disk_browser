@@ -35,8 +35,14 @@ def build_executable():
         "--add-data=webview_ui;webview_ui",  # Include web UI files
         "--add-data=disk_analyzer_fixed.py;.",  # Include local module as data
         "--add-data=live_update_system.py;.",   # Include live update module as data
+        "--add-data=windows_scanner.py;.",
+        "--add-data=normalized_cache.py;.",
+        "--add-data=usn_journal.py;.",
         "--hidden-import=disk_analyzer_fixed",  # Include local module
         "--hidden-import=live_update_system",   # Include live update module
+        "--hidden-import=windows_scanner",
+        "--hidden-import=normalized_cache",
+        "--hidden-import=usn_journal",
         "--hidden-import=sqlite3",              # SQLite database support
         "--hidden-import=win32file",
         "--hidden-import=win32api", 

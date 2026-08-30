@@ -11,7 +11,7 @@ import time
 import json
 import sqlite3
 import threading
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ThreadPoolExecutor, wait, FIRST_COMPLETED
 
 from pathlib import Path
 from datetime import datetime
@@ -53,6 +53,24 @@ except ImportError:
     print("pywin32 not installed. Using standard Python methods.")
     print("Install with: pip install pywin32 for better performance")
 
+from windows_scanner import list_directory_entries, should_skip_recurse, SKIP_DIRS_SCAN
+from normalized_cache import (
+    ensure_cache_schema,
+    save_normalized_tree,
+    load_normalized_tree,
+    load_pickle_tree,
+    get_cache_meta,
+    has_normalized_cache,
+    CACHE_FORMAT_NORMALIZED,
+)
+from usn_journal import (
+    query_usn_journal,
+    read_usn_changes,
+    resolve_changed_directories,
+    MAX_USN_PATHS_BEFORE_FULL_SCAN,
+    UsnJournalState,
+)
+
 
 # Performance constants
 WORKER_THREADS = min(16, os.cpu_count() * 2)  # Reduced for better control
@@ -61,12 +79,9 @@ CACHE_SIZE = 50000  # Reasonable cache size
 PROGRESS_UPDATE_INTERVAL = 0.1  # Update UI every 100ms
 MAX_DEPTH = 20  # Maximum recursion depth
 CACHE_SAVE_DEBOUNCE_SEC = 30.0  # Debounce live-update cache writes
+USE_PARALLEL_SCAN = True  # Parallel BFS on Windows when pywin32 is available
 
-# Directories to skip for performance (but still count their size)
-SKIP_DIRS_SCAN = {
-    '$RECYCLE.BIN', 'System Volume Information', 'Recovery', 
-    'Windows.old', 'Config.Msi'
-}
+# Legacy alias — extended skip list lives in windows_scanner.py
 
 @dataclass
 class FileNode:
@@ -184,12 +199,15 @@ class DebouncedCacheSaver:
         self._timer: Optional[threading.Timer] = None
         self._pending_root: Optional[FileNode] = None
         self._pending_usn: Optional[int] = None
+        self._pending_usn_next: Optional[int] = None
 
-    def schedule_save(self, root_node: FileNode, usn: Optional[int] = None) -> None:
+    def schedule_save(self, root_node: FileNode, usn: Optional[int] = None, usn_next: Optional[int] = None) -> None:
         with self._lock:
             self._pending_root = root_node
             if usn is not None:
                 self._pending_usn = usn
+            if usn_next is not None:
+                self._pending_usn_next = usn_next
             if self._timer is not None:
                 self._timer.cancel()
             self._timer = threading.Timer(self.debounce_sec, self._flush)
@@ -200,15 +218,20 @@ class DebouncedCacheSaver:
         with self._lock:
             root = self._pending_root
             usn = self._pending_usn
+            usn_next = self._pending_usn_next
             self._pending_root = None
             self._pending_usn = None
+            self._pending_usn_next = None
             self._timer = None
         if not root:
             return
         try:
-            if usn is None:
-                usn = self.scanner.get_current_usn(root.path)
-            self.scanner.save_to_cache(root, usn)
+            state = query_usn_journal(root.path)
+            if usn is None and state:
+                usn = state.journal_id
+            if usn_next is None and state:
+                usn_next = state.next_usn
+            self.scanner.save_to_cache(root, usn or 0, usn_next or 0)
             logging.info("Debounced cache save completed")
         except Exception as e:
             logging.error(f"Debounced cache save failed: {e}")
@@ -248,17 +271,27 @@ class FixedDiskScanner:
         """Initialize the SQLite database for caching"""
         try:
             with sqlite3.connect(self.db_path) as conn:
-                conn.execute('''
-                    CREATE TABLE IF NOT EXISTS scan_cache (
-                        drive TEXT PRIMARY KEY,
-                        data BLOB,
-                        timestamp INTEGER,
-                        usn_journal_id INTEGER
-                    )
-                ''')
+                ensure_cache_schema(conn)
                 conn.commit()
         except Exception as e:
             print(f"Database initialization error: {e}")
+
+    def _resolve_drive_keys(self, path: str) -> List[str]:
+        normalized = os.path.abspath(path)
+        keys = [normalized]
+        if len(normalized) >= 2 and normalized[1] == ':':
+            alt = normalized.rstrip('\\') + '\\'
+            if alt != normalized:
+                keys.append(alt)
+        return keys
+
+    def _get_usn_state(self, path: str) -> Optional[UsnJournalState]:
+        return query_usn_journal(path)
+
+    def get_current_usn(self, path: str) -> int:
+        """Backward-compatible: returns journal NextUsn (not journal ID)."""
+        state = self._get_usn_state(path)
+        return state.next_usn if state else 0
     
     def set_progress_callback(self, callback):
         """Set callback for progress updates"""
@@ -301,8 +334,11 @@ class FixedDiskScanner:
             self.processed_items = 0
             self.total_items = 0
             
-            # Perform scan
-            root_node = self._scan_directory_recursive(path)
+            # Perform scan (parallel on Windows when available)
+            if USE_PARALLEL_SCAN and HAS_WIN32:
+                root_node = self._scan_directory_parallel(path)
+            else:
+                root_node = self._scan_directory_recursive(path)
             
             if root_node:
                 FileNode.finalize_dir_size(root_node)
@@ -315,8 +351,10 @@ class FixedDiskScanner:
                 
                 # Save to cache
                 try:
-                    usn = self.get_current_usn(path)
-                    self.save_to_cache(root_node, usn)
+                    usn_state = self._get_usn_state(path)
+                    journal_id = usn_state.journal_id if usn_state else 0
+                    usn_next = usn_state.next_usn if usn_state else 0
+                    self.save_to_cache(root_node, journal_id, usn_next)
                     logging.info("Data saved to cache")
                 except Exception as e:
                     logging.warning(f"Failed to save cache: {e}")
@@ -413,6 +451,151 @@ class FixedDiskScanner:
         except Exception as e:
             logging.error(f"Error scanning {path}: {e}")
             return None
+
+    def _scan_directory_parallel(self, path: str) -> Optional[FileNode]:
+        """Breadth-first parallel scan using fast Win32 directory listing."""
+        root_node = FileNode(
+            path=path,
+            name=os.path.basename(path) or path,
+            is_dir=True,
+        )
+        dir_queue: deque = deque([(path, root_node, 0)])
+        pending: Dict = {}
+
+        with ThreadPoolExecutor(max_workers=WORKER_THREADS) as executor:
+            while dir_queue or pending:
+                while dir_queue and len(pending) < WORKER_THREADS * 2:
+                    dir_path, parent_node, depth = dir_queue.popleft()
+                    if depth > MAX_DEPTH:
+                        continue
+                    future = executor.submit(self._list_dir_worker, dir_path)
+                    pending[future] = (parent_node, dir_path, depth)
+
+                if not pending:
+                    break
+
+                done, _ = wait(pending.keys(), timeout=0.05, return_when=FIRST_COMPLETED)
+                if not done:
+                    continue
+
+                for future in done:
+                    parent_node, dir_path, depth = pending.pop(future)
+                    try:
+                        entries = future.result()
+                    except Exception as exc:
+                        logging.debug(f"Parallel scan worker failed for {dir_path}: {exc}")
+                        continue
+
+                    if entries is None:
+                        continue
+
+                    self.update_progress(dir_path)
+                    self.processed_items += 1
+
+                    for entry in entries:
+                        entry_path = os.path.join(dir_path, entry.name)
+                        if entry.is_dir:
+                            if entry.skip_recurse:
+                                dir_size = self._get_directory_size_fast(entry_path)
+                                skip_node = FileNode(
+                                    path=entry_path,
+                                    name=entry.name,
+                                    size=dir_size,
+                                    is_dir=True,
+                                    parent=parent_node,
+                                )
+                                parent_node.children.append(skip_node)
+                                parent_node.dir_count += 1
+                            else:
+                                child_node = FileNode(
+                                    path=entry_path,
+                                    name=entry.name,
+                                    is_dir=True,
+                                    mtime=entry.mtime,
+                                    parent=parent_node,
+                                )
+                                parent_node.children.append(child_node)
+                                parent_node.dir_count += 1
+                                if depth + 1 <= MAX_DEPTH:
+                                    dir_queue.append((entry_path, child_node, depth + 1))
+                        else:
+                            file_node = FileNode(
+                                path=entry_path,
+                                name=entry.name,
+                                size=entry.size,
+                                is_dir=False,
+                                mtime=entry.mtime,
+                                parent=parent_node,
+                            )
+                            parent_node.children.append(file_node)
+                            parent_node.file_count += 1
+
+        return root_node
+
+    def _list_dir_worker(self, path: str):
+        return list_directory_entries(path)
+
+    def _rescan_directory(self, path: str) -> Optional[FileNode]:
+        """Rescan a single directory subtree (used for incremental USN refresh)."""
+        if USE_PARALLEL_SCAN and HAS_WIN32:
+            return self._scan_directory_parallel(path)
+        return self._scan_directory_recursive(path)
+
+    def _apply_rescan_to_tree(self, root: FileNode, dir_path: str, fresh_node: FileNode) -> None:
+        """Replace a directory node in the tree with freshly scanned data."""
+        target = self.find_node_by_path(root, dir_path)
+        if not target or not target.is_dir:
+            return
+        target.children = fresh_node.children
+        target.file_count = fresh_node.file_count
+        target.dir_count = fresh_node.dir_count
+        target.size = fresh_node.size
+        target.mtime = fresh_node.mtime
+        for child in target.children:
+            child.parent = target
+        target.invalidate_size_cache()
+
+    def _incremental_refresh(self, root_node: FileNode, path: str, cached_journal_id: int, cached_next_usn: int) -> FileNode:
+        state = self._get_usn_state(path)
+        if not state:
+            logging.info("USN journal unavailable; using cached tree")
+            return root_node
+
+        if cached_journal_id and state.journal_id != cached_journal_id:
+            logging.info("USN journal recreated; performing full rescan")
+            return self.scan_directory(path, use_cache=False)
+
+        if cached_next_usn and state.next_usn <= cached_next_usn:
+            logging.info("No USN changes since last cache save")
+            return root_node
+
+        changed_names, _latest = read_usn_changes(path, cached_next_usn, state.journal_id)
+        if not changed_names:
+            logging.info("USN advanced but no relevant records; using cached tree")
+            return root_node
+
+        dirs_to_rescan = resolve_changed_directories(
+            path,
+            changed_names,
+            self.find_node_by_path,
+            root_node,
+        )
+
+        if not dirs_to_rescan or len(dirs_to_rescan) > MAX_USN_PATHS_BEFORE_FULL_SCAN:
+            logging.info(
+                f"USN refresh: {len(dirs_to_rescan)} dirs changed — performing full rescan"
+            )
+            return self.scan_directory(path, use_cache=False)
+
+        logging.info(f"USN incremental refresh for {len(dirs_to_rescan)} directories")
+        for dir_path in sorted(dirs_to_rescan, key=len):
+            fresh = self._rescan_directory(dir_path)
+            if fresh:
+                self._apply_rescan_to_tree(root_node, dir_path, fresh)
+
+        FileNode.finalize_dir_size(root_node)
+        self.save_to_cache(root_node, state.journal_id, state.next_usn)
+        return root_node
     
     def _get_directory_size_fast(self, path: str) -> int:
         """Get directory size quickly without full recursion"""
@@ -451,43 +634,31 @@ class FixedDiskScanner:
             pass
         return total
     
-    def save_to_cache(self, root_node: FileNode, usn_journal_id: int = 0):
-        """Save scan results to cache"""
+    def save_to_cache(self, root_node: FileNode, usn_journal_id: int = 0, usn_next: int = 0):
+        """Save scan results to normalized SQLite cache."""
         try:
-            # Serialize the tree
-            data = pickle.dumps(root_node)
-            timestamp = int(time.time())
-            
             with sqlite3.connect(self.db_path) as conn:
-                conn.execute(
-                    'INSERT OR REPLACE INTO scan_cache (drive, data, timestamp, usn_journal_id) VALUES (?, ?, ?, ?)',
-                    (root_node.path, data, timestamp, usn_journal_id)
-                )
+                ensure_cache_schema(conn)
+                save_normalized_tree(conn, root_node, usn_journal_id, usn_next)
                 conn.commit()
-                
+            logging.info(f"Saved normalized cache for {root_node.path}")
         except Exception as e:
             logging.error(f"Cache save error: {e}")
     
     def cache_exists(self, path: str) -> bool:
         """Check if a cache entry exists without deserializing scan data."""
         try:
-            normalized = os.path.abspath(path)
             with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.execute(
-                    'SELECT 1 FROM scan_cache WHERE drive = ? LIMIT 1',
-                    (normalized,)
-                )
-                if cursor.fetchone():
-                    return True
-                # Legacy rows may use alternate path forms (e.g. C:\ vs C:)
-                if len(normalized) >= 2 and normalized[1] == ':':
-                    alt = normalized.rstrip('\\') + '\\'
-                    if alt != normalized:
-                        cursor = conn.execute(
-                            'SELECT 1 FROM scan_cache WHERE drive = ? LIMIT 1',
-                            (alt,),
-                        )
-                        return cursor.fetchone() is not None
+                ensure_cache_schema(conn)
+                for key in self._resolve_drive_keys(path):
+                    if has_normalized_cache(conn, key):
+                        return True
+                    cursor = conn.execute(
+                        'SELECT 1 FROM scan_cache WHERE drive = ? AND data IS NOT NULL LIMIT 1',
+                        (key,),
+                    )
+                    if cursor.fetchone():
+                        return True
         except Exception as e:
             logging.error(f"Cache existence check error: {e}")
         return False
@@ -496,113 +667,83 @@ class FixedDiskScanner:
         """Return drive paths that have cached scan data (metadata only)."""
         try:
             with sqlite3.connect(self.db_path) as conn:
+                ensure_cache_schema(conn)
+                drives: List[str] = []
                 cursor = conn.execute('SELECT drive FROM scan_cache ORDER BY timestamp DESC')
-                return [row[0] for row in cursor.fetchall()]
+                for (drive,) in cursor.fetchall():
+                    if has_normalized_cache(conn, drive):
+                        drives.append(drive)
+                        continue
+                    row = conn.execute(
+                        'SELECT 1 FROM scan_cache WHERE drive = ? AND data IS NOT NULL',
+                        (drive,),
+                    ).fetchone()
+                    if row:
+                        drives.append(drive)
+                return drives
         except Exception as e:
             logging.error(f"Cache list error: {e}")
             return []
 
     def load_from_cache(self, path: str) -> Optional[FileNode]:
-        """Load scan results from cache"""
+        """Load scan results from normalized cache, with pickle fallback + migration."""
         try:
-            normalized = os.path.abspath(path)
             with sqlite3.connect(self.db_path) as conn:
-                cursor = conn.execute(
-                    'SELECT data FROM scan_cache WHERE drive = ?',
-                    (normalized,)
-                )
-                result = cursor.fetchone()
-                if not result and len(normalized) >= 2 and normalized[1] == ':':
-                    alt = normalized.rstrip('\\') + '\\'
-                    if alt != normalized:
-                        cursor = conn.execute(
-                            'SELECT data FROM scan_cache WHERE drive = ?',
-                            (alt,),
-                        )
-                        result = cursor.fetchone()
+                ensure_cache_schema(conn)
+                for key in self._resolve_drive_keys(path):
+                    root = load_normalized_tree(conn, key)
+                    if root:
+                        FileNode.ensure_tree_sizes(root)
+                        return root
 
-                if result:
-                    return pickle.loads(result[0])
-                    
+                    root = load_pickle_tree(conn, key)
+                    if root:
+                        logging.info(f"Migrating pickle cache to normalized format for {key}")
+                        meta = get_cache_meta(conn, key)
+                        journal_id = meta[1] if meta else 0
+                        usn_next = meta[2] if meta else 0
+                        state = self._get_usn_state(key)
+                        if state:
+                            journal_id = state.journal_id
+                            usn_next = state.next_usn
+                        save_normalized_tree(conn, root, journal_id, usn_next)
+                        conn.commit()
+                        FileNode.ensure_tree_sizes(root)
+                        return root
         except Exception as e:
             logging.error(f"Cache load error: {e}")
         
         return None
     
-    def get_current_usn(self, path: str) -> int:
-        """Get current USN journal ID for a drive (Windows specific)"""
-        try:
-            if not HAS_WIN32:
-                return 0
-                
-            drive_letter = path[0] if len(path) > 0 else 'C'
-            volume_path = f"\\\\.\\{drive_letter}:"
-            
-            handle = win32file.CreateFile(
-                volume_path,
-                win32file.GENERIC_READ,
-                win32file.FILE_SHARE_READ | win32file.FILE_SHARE_WRITE,
-                None,
-                win32file.OPEN_EXISTING,
-                0,
-                None
-            )
-            
-            try:
-                # Query USN Journal
-                usn_info = win32file.DeviceIoControl(
-                    handle,
-                    winioctlcon.FSCTL_QUERY_USN_JOURNAL,
-                    None,
-                    1024
-                )
-                
-                if len(usn_info) >= 8:
-                    return struct.unpack('<Q', usn_info[:8])[0]
-                    
-            finally:
-                win32file.CloseHandle(handle)
-                
-        except Exception as e:
-            logging.debug(f"USN query failed: {e}")
-            
-        return 0
-    
     def refresh_from_cache(self, path: str) -> Optional[FileNode]:
-        """Load from cache or perform incremental refresh"""
+        """Load from cache and incrementally refresh changed directories via USN."""
         try:
-            # First try to load from cache
+            path = os.path.abspath(path)
             root_node = self.load_from_cache(path)
             if not root_node:
                 logging.info("No cache found, performing full scan")
                 return self.scan_directory(path, use_cache=False)
-            
-            # Try USN-based refresh if we have admin rights and it's Windows
+
             if HAS_WIN32 and self._is_admin():
                 try:
-                    current_usn = self.get_current_usn(path)
                     with sqlite3.connect(self.db_path) as conn:
-                        cursor = conn.execute(
-                            'SELECT usn_journal_id FROM scan_cache WHERE drive = ?',
-                            (path,)
-                        )
-                        result = cursor.fetchone()
-                        cached_usn = result[0] if result else 0
-                    
-                    if current_usn > cached_usn:
-                        logging.info("Changes detected via USN journal, refreshing cache")
-                        return self.scan_directory(path, use_cache=False)
-                    else:
-                        logging.info("No changes detected, using cached data")
-                        return root_node
-                        
+                        ensure_cache_schema(conn)
+                        meta = None
+                        for key in self._resolve_drive_keys(path):
+                            meta = get_cache_meta(conn, key)
+                            if meta:
+                                break
+                    cached_journal_id = meta[1] if meta else 0
+                    cached_next_usn = meta[2] if meta else 0
+                    return self._incremental_refresh(
+                        root_node, path, cached_journal_id, cached_next_usn
+                    )
                 except Exception as e:
                     logging.debug(f"USN refresh failed: {e}")
-            
-            # Fallback: return cached data
+
             logging.info("Using cached data (no USN refresh available)")
             return root_node
-            
+
         except Exception as e:
             logging.error(f"Cache refresh error: {e}")
             return None
