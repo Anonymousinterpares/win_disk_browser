@@ -39,12 +39,14 @@ def build_executable():
         "--add-data=normalized_cache.py;.",
         "--add-data=usn_journal.py;.",
         "--add-data=mft_scanner.py;.",
+        "--add-data=mmap_snapshot.py;.",
         "--hidden-import=disk_analyzer_fixed",  # Include local module
         "--hidden-import=live_update_system",   # Include live update module
         "--hidden-import=windows_scanner",
         "--hidden-import=normalized_cache",
         "--hidden-import=usn_journal",
         "--hidden-import=mft_scanner",
+        "--hidden-import=mmap_snapshot",
         "--hidden-import=sqlite3",              # SQLite database support
         "--hidden-import=win32file",
         "--hidden-import=win32api", 

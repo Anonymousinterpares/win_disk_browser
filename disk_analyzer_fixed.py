@@ -54,12 +54,21 @@ except ImportError:
     print("Install with: pip install pywin32 for better performance")
 
 from windows_scanner import list_directory_entries, should_skip_recurse, SKIP_DIRS_SCAN
+from mmap_snapshot import (
+    CACHE_FORMAT_MMAP,
+    save_mmap_snapshot,
+    load_mmap_snapshot,
+    snapshot_file_path,
+    has_mmap_snapshot,
+)
 from normalized_cache import (
     ensure_cache_schema,
     save_normalized_tree,
     load_normalized_tree,
     load_pickle_tree,
     get_cache_meta,
+    get_snapshot_path,
+    upsert_scan_cache_meta,
     has_normalized_cache,
     _configure_cache_connection,
     CACHE_FORMAT_NORMALIZED,
@@ -647,22 +656,47 @@ class FixedDiskScanner:
         return total
     
     def save_to_cache(self, root_node: FileNode, usn_journal_id: int = 0, usn_next: int = 0):
-        """Save scan results to normalized SQLite cache."""
+        """Save scan results to mmap snapshot (fast load) plus SQLite metadata."""
+        drive = root_node.path
+        snapshot_path = snapshot_file_path(self.db_path, drive)
         try:
+            save_mmap_snapshot(root_node, snapshot_path, usn_journal_id, usn_next)
             with sqlite3.connect(self.db_path) as conn:
                 ensure_cache_schema(conn)
-                save_normalized_tree(conn, root_node, usn_journal_id, usn_next)
+                conn.execute('DELETE FROM cache_nodes WHERE drive = ?', (drive,))
+                upsert_scan_cache_meta(
+                    conn,
+                    drive,
+                    CACHE_FORMAT_MMAP,
+                    usn_journal_id,
+                    usn_next,
+                    snapshot_path,
+                )
                 conn.commit()
-            logging.info(f"Saved normalized cache for {root_node.path}")
+            logging.info(f'Saved mmap cache for {drive}')
         except Exception as e:
-            logging.error(f"Cache save error: {e}")
+            logging.error(f'Mmap cache save error: {e}')
+            try:
+                with sqlite3.connect(self.db_path) as conn:
+                    ensure_cache_schema(conn)
+                    save_normalized_tree(conn, root_node, usn_journal_id, usn_next)
+                    conn.commit()
+                logging.info(f'Saved normalized SQLite fallback cache for {drive}')
+            except Exception as fallback_error:
+                logging.error(f'Cache save fallback error: {fallback_error}')
     
     def cache_exists(self, path: str) -> bool:
         """Check if a cache entry exists without deserializing scan data."""
         try:
+            for key in self._resolve_drive_keys(path):
+                if has_mmap_snapshot(snapshot_file_path(self.db_path, key)):
+                    return True
             with sqlite3.connect(self.db_path) as conn:
                 ensure_cache_schema(conn)
                 for key in self._resolve_drive_keys(path):
+                    stored = get_snapshot_path(conn, key)
+                    if stored and has_mmap_snapshot(stored):
+                        return True
                     if has_normalized_cache(conn, key):
                         return True
                     cursor = conn.execute(
@@ -678,13 +712,29 @@ class FixedDiskScanner:
     def list_cached_drives(self) -> List[str]:
         """Return drive paths that have cached scan data (metadata only)."""
         try:
+            drives: List[str] = []
+            seen: Set[str] = set()
             with sqlite3.connect(self.db_path) as conn:
                 ensure_cache_schema(conn)
-                drives: List[str] = []
-                cursor = conn.execute('SELECT drive FROM scan_cache ORDER BY timestamp DESC')
-                for (drive,) in cursor.fetchall():
+                cursor = conn.execute(
+                    'SELECT drive, snapshot_path, cache_format FROM scan_cache ORDER BY timestamp DESC'
+                )
+                for drive, snapshot_path, cache_format in cursor.fetchall():
+                    if drive in seen:
+                        continue
+                    if snapshot_path and has_mmap_snapshot(snapshot_path):
+                        drives.append(drive)
+                        seen.add(drive)
+                        continue
+                    if int(cache_format or 0) == CACHE_FORMAT_MMAP and has_mmap_snapshot(
+                        snapshot_file_path(self.db_path, drive)
+                    ):
+                        drives.append(drive)
+                        seen.add(drive)
+                        continue
                     if has_normalized_cache(conn, drive):
                         drives.append(drive)
+                        seen.add(drive)
                         continue
                     row = conn.execute(
                         'SELECT 1 FROM scan_cache WHERE drive = ? AND data IS NOT NULL',
@@ -692,15 +742,35 @@ class FixedDiskScanner:
                     ).fetchone()
                     if row:
                         drives.append(drive)
-                return drives
+                        seen.add(drive)
+            return drives
         except Exception as e:
             logging.error(f"Cache list error: {e}")
             return []
 
     def load_from_cache(self, path: str) -> Optional[FileNode]:
-        """Load scan results from normalized cache, with pickle fallback + migration."""
+        """Load scan results — mmap snapshot first, then SQLite/pickle fallbacks."""
         try:
             start = time.time()
+            for key in self._resolve_drive_keys(path):
+                snapshot_candidates = [snapshot_file_path(self.db_path, key)]
+                with sqlite3.connect(self.db_path) as conn:
+                    _configure_cache_connection(conn)
+                    ensure_cache_schema(conn)
+                    stored = get_snapshot_path(conn, key)
+                    if stored:
+                        snapshot_candidates.insert(0, stored)
+
+                for snapshot_path in snapshot_candidates:
+                    if has_mmap_snapshot(snapshot_path):
+                        root = load_mmap_snapshot(snapshot_path)
+                        if root:
+                            elapsed = time.time() - start
+                            logging.info(
+                                f'Loaded mmap cache for {key} in {elapsed:.2f}s'
+                            )
+                            return root
+
             with sqlite3.connect(self.db_path) as conn:
                 _configure_cache_connection(conn)
                 ensure_cache_schema(conn)
@@ -716,7 +786,7 @@ class FixedDiskScanner:
 
                     root = load_pickle_tree(conn, key)
                     if root:
-                        logging.info(f"Migrating pickle cache to normalized format for {key}")
+                        logging.info(f"Migrating pickle cache to mmap format for {key}")
                         meta = get_cache_meta(conn, key)
                         journal_id = meta[1] if meta else 0
                         usn_next = meta[2] if meta else 0
@@ -724,9 +794,7 @@ class FixedDiskScanner:
                         if state:
                             journal_id = state.journal_id
                             usn_next = state.next_usn
-                        save_normalized_tree(conn, root, journal_id, usn_next)
-                        conn.commit()
-                        FileNode.ensure_tree_sizes(root)
+                        self.save_to_cache(root, journal_id, usn_next)
                         return root
         except Exception as e:
             logging.error(f"Cache load error: {e}")

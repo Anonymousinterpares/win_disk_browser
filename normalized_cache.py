@@ -10,6 +10,8 @@ from typing import List, Optional, Tuple, Any
 
 CACHE_FORMAT_PICKLE = 1
 CACHE_FORMAT_NORMALIZED = 2
+# CACHE_FORMAT_MMAP = 3 lives in mmap_snapshot.py
+# CACHE_FORMAT_MMAP = 3 lives in mmap_snapshot.py
 
 
 def _configure_cache_connection(conn: sqlite3.Connection, *, write: bool = False) -> None:
@@ -57,6 +59,8 @@ def ensure_cache_schema(conn: sqlite3.Connection) -> None:
         conn.execute('ALTER TABLE scan_cache ADD COLUMN usn_next INTEGER DEFAULT 0')
     if 'cache_format' not in columns:
         conn.execute('ALTER TABLE scan_cache ADD COLUMN cache_format INTEGER DEFAULT 1')
+    if 'snapshot_path' not in columns:
+        conn.execute('ALTER TABLE scan_cache ADD COLUMN snapshot_path TEXT')
 
 
 def _drive_key(path: str) -> str:
@@ -183,6 +187,36 @@ def get_cache_meta(conn: sqlite3.Connection, drive: str) -> Optional[Tuple[int, 
     if not row:
         return None
     return int(row[0] or CACHE_FORMAT_PICKLE), int(row[1] or 0), int(row[2] or 0)
+
+
+def get_snapshot_path(conn: sqlite3.Connection, drive: str) -> Optional[str]:
+    cursor = conn.execute(
+        'SELECT snapshot_path FROM scan_cache WHERE drive = ?',
+        (drive,),
+    )
+    row = cursor.fetchone()
+    if not row or not row[0]:
+        return None
+    return str(row[0])
+
+
+def upsert_scan_cache_meta(
+    conn: sqlite3.Connection,
+    drive: str,
+    cache_format: int,
+    usn_journal_id: int,
+    usn_next: int,
+    snapshot_path: Optional[str] = None,
+) -> None:
+    timestamp = int(time.time())
+    conn.execute(
+        '''
+        INSERT OR REPLACE INTO scan_cache
+            (drive, data, timestamp, usn_journal_id, usn_next, cache_format, snapshot_path)
+        VALUES (?, NULL, ?, ?, ?, ?, ?)
+        ''',
+        (drive, timestamp, usn_journal_id, usn_next, cache_format, snapshot_path),
+    )
 
 
 def has_normalized_cache(conn: sqlite3.Connection, drive: str) -> bool:
