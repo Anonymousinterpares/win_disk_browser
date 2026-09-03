@@ -1,10 +1,16 @@
-"""Round-trip tests for mmap snapshot cache."""
+"""Round-trip tests for compressed snapshot cache."""
 
 import os
 import tempfile
+import zlib
 
 from disk_analyzer_fixed import FileNode
-from mmap_snapshot import load_mmap_snapshot, save_mmap_snapshot, has_mmap_snapshot
+from mmap_snapshot import (
+    load_mmap_snapshot,
+    save_mmap_snapshot,
+    has_mmap_snapshot,
+    _build_v2_payload,
+)
 
 
 def _make_sample_tree():
@@ -18,10 +24,10 @@ def _make_sample_tree():
     return root
 
 
-def test_mmap_snapshot_roundtrip():
+def test_compressed_snapshot_roundtrip():
     root = _make_sample_tree()
     with tempfile.TemporaryDirectory() as tmp:
-        path = os.path.join(tmp, 'C_.mmap')
+        path = os.path.join(tmp, 'C_.snap')
         save_mmap_snapshot(root, path, usn_journal_id=7, usn_next=99)
         assert has_mmap_snapshot(path)
         loaded = load_mmap_snapshot(path)
@@ -34,10 +40,10 @@ def test_mmap_snapshot_roundtrip():
         assert len(loaded.children[0].children) == 2
 
 
-def test_mmap_snapshot_preserves_paths():
+def test_compressed_snapshot_preserves_paths():
     root = _make_sample_tree()
     with tempfile.TemporaryDirectory() as tmp:
-        path = os.path.join(tmp, 'C_.mmap')
+        path = os.path.join(tmp, 'C_.snap')
         save_mmap_snapshot(root, path)
         loaded = load_mmap_snapshot(path)
         paths = set()
@@ -50,3 +56,13 @@ def test_mmap_snapshot_preserves_paths():
         walk(loaded)
         assert 'C:\\Windows\\a.dll' in paths
         assert 'C:\\Windows\\b.dll' in paths
+
+
+def test_compressed_snapshot_smaller_than_uncompressed():
+    root = _make_sample_tree()
+    payload = _build_v2_payload(root, 0, 0)
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, 'C_.snap')
+        save_mmap_snapshot(root, path)
+        compressed_size = os.path.getsize(path)
+        assert compressed_size < len(payload)

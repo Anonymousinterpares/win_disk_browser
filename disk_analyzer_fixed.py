@@ -59,6 +59,8 @@ from mmap_snapshot import (
     save_mmap_snapshot,
     load_mmap_snapshot,
     snapshot_file_path,
+    legacy_mmap_path,
+    find_snapshot_for_drive,
     has_mmap_snapshot,
 )
 from normalized_cache import (
@@ -89,7 +91,8 @@ BATCH_SIZE = 500  # Smaller batches for more frequent updates
 CACHE_SIZE = 50000  # Reasonable cache size
 PROGRESS_UPDATE_INTERVAL = 0.1  # Update UI every 100ms
 MAX_DEPTH = 20  # Maximum recursion depth
-CACHE_SAVE_DEBOUNCE_SEC = 30.0  # Debounce live-update cache writes
+CACHE_SAVE_DEBOUNCE_SEC = 30.0  # Debounce full snapshot writes
+CACHE_METADATA_DEBOUNCE_SEC = 5.0  # Debounce live metadata-only DB updates
 USE_PARALLEL_SCAN = True  # Parallel BFS on Windows when pywin32 is available
 USE_MFT_SCAN = True  # NTFS MFT fast path when elevated (WizTree-class)
 
@@ -202,7 +205,7 @@ class FileNode:
 
 
 class DebouncedCacheSaver:
-    """Coalesces frequent cache writes from live filesystem updates."""
+    """Coalesces cache writes — metadata-only for live updates, full snapshot on scan/exit."""
 
     def __init__(self, scanner: 'FixedDiskScanner', debounce_sec: float = CACHE_SAVE_DEBOUNCE_SEC):
         self.scanner = scanner
@@ -212,17 +215,27 @@ class DebouncedCacheSaver:
         self._pending_root: Optional[FileNode] = None
         self._pending_usn: Optional[int] = None
         self._pending_usn_next: Optional[int] = None
+        self._pending_full_snapshot = True
 
-    def schedule_save(self, root_node: FileNode, usn: Optional[int] = None, usn_next: Optional[int] = None) -> None:
+    def schedule_save(
+        self,
+        root_node: FileNode,
+        usn: Optional[int] = None,
+        usn_next: Optional[int] = None,
+        full_snapshot: bool = False,
+    ) -> None:
+        debounce = self.debounce_sec if full_snapshot else CACHE_METADATA_DEBOUNCE_SEC
         with self._lock:
             self._pending_root = root_node
             if usn is not None:
                 self._pending_usn = usn
             if usn_next is not None:
                 self._pending_usn_next = usn_next
+            if full_snapshot:
+                self._pending_full_snapshot = True
             if self._timer is not None:
                 self._timer.cancel()
-            self._timer = threading.Timer(self.debounce_sec, self._flush)
+            self._timer = threading.Timer(debounce, self._flush)
             self._timer.daemon = True
             self._timer.start()
 
@@ -231,9 +244,11 @@ class DebouncedCacheSaver:
             root = self._pending_root
             usn = self._pending_usn
             usn_next = self._pending_usn_next
+            full_snapshot = self._pending_full_snapshot
             self._pending_root = None
             self._pending_usn = None
             self._pending_usn_next = None
+            self._pending_full_snapshot = True
             self._timer = None
         if not root:
             return
@@ -243,16 +258,22 @@ class DebouncedCacheSaver:
                 usn = state.journal_id
             if usn_next is None and state:
                 usn_next = state.next_usn
-            self.scanner.save_to_cache(root, usn or 0, usn_next or 0)
-            logging.info("Debounced cache save completed")
+            if full_snapshot:
+                self.scanner.save_to_cache(root, usn or 0, usn_next or 0)
+                logging.info("Debounced full cache save completed")
+            else:
+                self.scanner.save_cache_metadata(root, usn or 0, usn_next or 0)
+                logging.info("Debounced metadata-only cache update completed")
         except Exception as e:
             logging.error(f"Debounced cache save failed: {e}")
 
-    def flush_now(self) -> None:
+    def flush_now(self, full_snapshot: bool = True) -> None:
         with self._lock:
             if self._timer is not None:
                 self._timer.cancel()
                 self._timer = None
+            if full_snapshot:
+                self._pending_full_snapshot = True
         self._flush()
 
 
@@ -267,6 +288,7 @@ class FixedDiskScanner:
         self.last_update_time = 0
         self.event_queue = queue.Queue()
         self.cache_saver = DebouncedCacheSaver(self)
+        self.root_node: Optional[FileNode] = None
         
         # Initialize database
         self.init_database()
@@ -576,7 +598,14 @@ class FixedDiskScanner:
             child.parent = target
         target.invalidate_size_cache()
 
-    def _incremental_refresh(self, root_node: FileNode, path: str, cached_journal_id: int, cached_next_usn: int) -> FileNode:
+    def _incremental_refresh(
+        self,
+        root_node: FileNode,
+        path: str,
+        cached_journal_id: int,
+        cached_next_usn: int,
+        persist_snapshot: bool = True,
+    ) -> FileNode:
         state = self._get_usn_state(path)
         if not state:
             logging.info("USN journal unavailable; using cached tree")
@@ -610,12 +639,16 @@ class FixedDiskScanner:
 
         logging.info(f"USN incremental refresh for {len(dirs_to_rescan)} directories")
         for dir_path in sorted(dirs_to_rescan, key=len):
+            self.update_progress(dir_path)
             fresh = self._rescan_directory(dir_path)
             if fresh:
                 self._apply_rescan_to_tree(root_node, dir_path, fresh)
 
         FileNode.finalize_dir_size(root_node)
-        self.save_to_cache(root_node, state.journal_id, state.next_usn)
+        if persist_snapshot:
+            self.save_to_cache(root_node, state.journal_id, state.next_usn)
+        else:
+            self.save_cache_metadata(root_node, state.journal_id, state.next_usn)
         return root_node
     
     def _get_directory_size_fast(self, path: str) -> int:
@@ -655,6 +688,25 @@ class FixedDiskScanner:
             pass
         return total
     
+    def save_cache_metadata(self, root_node: FileNode, usn_journal_id: int = 0, usn_next: int = 0):
+        """Update SQLite metadata only — fast path for live monitor (no snapshot rewrite)."""
+        drive = root_node.path
+        snapshot_path = find_snapshot_for_drive(self.db_path, drive) or snapshot_file_path(self.db_path, drive)
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                ensure_cache_schema(conn)
+                upsert_scan_cache_meta(
+                    conn,
+                    drive,
+                    CACHE_FORMAT_MMAP,
+                    usn_journal_id,
+                    usn_next,
+                    snapshot_path,
+                )
+                conn.commit()
+        except Exception as e:
+            logging.error(f'Cache metadata save error: {e}')
+
     def save_to_cache(self, root_node: FileNode, usn_journal_id: int = 0, usn_next: int = 0):
         """Save scan results to mmap snapshot (fast load) plus SQLite metadata."""
         drive = root_node.path
@@ -689,7 +741,7 @@ class FixedDiskScanner:
         """Check if a cache entry exists without deserializing scan data."""
         try:
             for key in self._resolve_drive_keys(path):
-                if has_mmap_snapshot(snapshot_file_path(self.db_path, key)):
+                if find_snapshot_for_drive(self.db_path, key):
                     return True
             with sqlite3.connect(self.db_path) as conn:
                 ensure_cache_schema(conn)
@@ -753,23 +805,43 @@ class FixedDiskScanner:
         try:
             start = time.time()
             for key in self._resolve_drive_keys(path):
-                snapshot_candidates = [snapshot_file_path(self.db_path, key)]
+                snapshot_candidates: List[str] = []
+                existing = find_snapshot_for_drive(self.db_path, key)
+                if existing:
+                    snapshot_candidates.append(existing)
+                snapshot_candidates.append(snapshot_file_path(self.db_path, key))
+                legacy = legacy_mmap_path(self.db_path, key)
+                if legacy not in snapshot_candidates:
+                    snapshot_candidates.append(legacy)
                 with sqlite3.connect(self.db_path) as conn:
                     _configure_cache_connection(conn)
                     ensure_cache_schema(conn)
                     stored = get_snapshot_path(conn, key)
-                    if stored:
+                    if stored and stored not in snapshot_candidates:
                         snapshot_candidates.insert(0, stored)
 
                 for snapshot_path in snapshot_candidates:
-                    if has_mmap_snapshot(snapshot_path):
-                        root = load_mmap_snapshot(snapshot_path)
-                        if root:
-                            elapsed = time.time() - start
-                            logging.info(
-                                f'Loaded mmap cache for {key} in {elapsed:.2f}s'
-                            )
-                            return root
+                    if not has_mmap_snapshot(snapshot_path):
+                        continue
+                    root = load_mmap_snapshot(snapshot_path)
+                    if not root:
+                        continue
+                    elapsed = time.time() - start
+                    logging.info(f'Loaded snapshot cache for {key} in {elapsed:.2f}s')
+                    if snapshot_path.endswith('.mmap'):
+                        logging.info(f'Migrating legacy mmap cache to compressed .snap for {key}')
+                        with sqlite3.connect(self.db_path) as conn:
+                            _configure_cache_connection(conn)
+                            ensure_cache_schema(conn)
+                            meta = get_cache_meta(conn, key)
+                        journal_id = meta[1] if meta else 0
+                        usn_next = meta[2] if meta else 0
+                        state = self._get_usn_state(key)
+                        if state:
+                            journal_id = state.journal_id
+                            usn_next = state.next_usn
+                        self.save_to_cache(root, journal_id, usn_next)
+                    return root
 
             with sqlite3.connect(self.db_path) as conn:
                 _configure_cache_connection(conn)
@@ -801,6 +873,32 @@ class FixedDiskScanner:
         
         return None
     
+    def sync_loaded_tree_from_usn(self, root_node: FileNode, path: str) -> FileNode:
+        """Apply USN changes to an in-memory tree without rewriting the snapshot file."""
+        path = os.path.abspath(path)
+        if not HAS_WIN32 or not self._is_admin():
+            return root_node
+        try:
+            with sqlite3.connect(self.db_path) as conn:
+                ensure_cache_schema(conn)
+                meta = None
+                for key in self._resolve_drive_keys(path):
+                    meta = get_cache_meta(conn, key)
+                    if meta:
+                        break
+            cached_journal_id = meta[1] if meta else 0
+            cached_next_usn = meta[2] if meta else 0
+            return self._incremental_refresh(
+                root_node,
+                path,
+                cached_journal_id,
+                cached_next_usn,
+                persist_snapshot=False,
+            )
+        except Exception as e:
+            logging.error(f'In-memory USN sync failed: {e}')
+            return root_node
+
     def refresh_from_cache(self, path: str) -> Optional[FileNode]:
         """Load from cache and incrementally refresh changed directories via USN."""
         try:
@@ -857,7 +955,7 @@ class FixedDiskScanner:
         self.event_queue.put(path)
     
     def find_node_by_path(self, root: FileNode, target_path: str) -> Optional[FileNode]:
-        """Find a node by path using breadth-first search"""
+        """Find a node by path using breadth-first search."""
         if not root:
             return None
             
@@ -874,6 +972,12 @@ class FixedDiskScanner:
                 for child in current.children:
                     q.append(child)
         return None
+
+    def _find_node_by_path(self, target_path: str) -> Optional[FileNode]:
+        """Find a node in the currently loaded tree (used by live update system)."""
+        if not self.root_node:
+            return None
+        return self.find_node_by_path(self.root_node, target_path)
 
 
 def main():

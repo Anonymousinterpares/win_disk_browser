@@ -16,6 +16,7 @@
             <select id="drive-select"></select>
             <button id="scan-button">Scan Fresh</button>
             <button id="cache-button">Load from Cache</button>
+            <button id="refresh-cache-button" title="Apply USN journal changes since last save (requires admin)">Refresh Cache</button>
             <label class="live-monitor-toggle" title="Watch for filesystem changes (uses background CPU/I/O)">
                 <input type="checkbox" id="live-monitor-toggle">
                 Live Monitor
@@ -95,7 +96,14 @@
             </div>
         </div>
 
-        <div id="status-bar">Ready. Select a drive and click Load from Cache or Scan Fresh.</div>
+        <div id="status-bar">
+            <span id="status-bar-text">Ready. Select a drive and click Load from Cache or Scan Fresh.</span>
+            <span id="live-monitor-status" class="live-monitor-status" hidden>
+                <span class="live-monitor-dot"></span>
+                <span id="live-monitor-status-text"></span>
+                <span id="live-monitor-progress" class="live-monitor-progress"></span>
+            </span>
+        </div>
     </div>
     <div id="scan-progress-overlay" class="scan-progress-overlay" hidden>
         <div class="scan-progress-panel">

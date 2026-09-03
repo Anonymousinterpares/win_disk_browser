@@ -3,10 +3,14 @@ window.addEventListener('pywebviewready', function() {
     const driveSelect = document.getElementById('drive-select');
     const scanButton = document.getElementById('scan-button');
     const cacheButton = document.getElementById('cache-button');
+    const refreshCacheButton = document.getElementById('refresh-cache-button');
     const liveMonitorToggle = document.getElementById('live-monitor-toggle');
+    const liveMonitorStatus = document.getElementById('live-monitor-status');
+    const liveMonitorStatusText = document.getElementById('live-monitor-status-text');
+    const liveMonitorProgress = document.getElementById('live-monitor-progress');
     const chartToggle = document.getElementById('chart-toggle');
     const chartContainer = document.getElementById('chart-container');
-    const statusBar = document.getElementById('status-bar');
+    const statusBar = document.getElementById('status-bar-text');
     const searchInput = document.getElementById('search-input');
     const searchResultsContainer = document.getElementById('search-results-container');
     const resetViewButton = document.getElementById('reset-view-button');
@@ -125,6 +129,43 @@ window.addEventListener('pywebviewready', function() {
         scanButton.disabled = !enabled;
         cacheButton.disabled = !enabled;
         driveSelect.disabled = !enabled;
+        updateRefreshButtonState();
+    }
+
+    function updateRefreshButtonState() {
+        if (!refreshCacheButton) return;
+        refreshCacheButton.disabled = !currentRootPath || fullScanInProgress;
+    }
+
+    function updateLiveMonitorStatus(payload) {
+        if (!liveMonitorStatus || !liveMonitorEnabled) {
+            if (liveMonitorStatus) liveMonitorStatus.hidden = true;
+            return;
+        }
+        const phase = payload?.phase || 'watching';
+        if (phase === 'idle') {
+            liveMonitorStatus.hidden = true;
+            return;
+        }
+        liveMonitorStatus.hidden = false;
+        liveMonitorStatus.className = 'live-monitor-status phase-' + phase;
+        if (liveMonitorStatusText) {
+            liveMonitorStatusText.textContent = payload?.message || 'Live monitor active';
+        }
+        if (liveMonitorProgress) {
+            let detail = '';
+            if (payload?.eventsTotal > 0) {
+                detail = `${payload.eventsDone || 0}/${payload.eventsTotal} events`;
+                if (payload.dirsTotal > 0) {
+                    detail += ` · ${payload.dirsTotal} folder(s)`;
+                }
+            } else if (payload?.processed > 0) {
+                detail = `${payload.processed.toLocaleString()} items`;
+            } else if (payload?.path) {
+                detail = truncatePath(payload.path, 48);
+            }
+            liveMonitorProgress.textContent = detail;
+        }
     }
 
     function truncatePath(path, maxLen = 88) {
@@ -176,6 +217,10 @@ window.addEventListener('pywebviewready', function() {
 
         if (payload.message) {
             scanProgressStatus.textContent = payload.message;
+        } else if (operation === 'cache' && activeOperation === 'cache' && scanProgressTitle.textContent.includes('Refresh')) {
+            scanProgressStatus.textContent = itemsScanned > 0
+                ? `Refreshing cache — ${itemsScanned.toLocaleString()} items processed`
+                : 'Refreshing cache from USN journal…';
         } else if (operation === 'cache') {
             scanProgressStatus.textContent = itemsScanned > 0
                 ? `Refreshing cache — ${itemsScanned.toLocaleString()} items processed`
@@ -1563,9 +1608,43 @@ chartContainer.addEventListener('wheel', function(event) {
             liveMonitorEnabled = liveMonitorToggle.checked;
             syncLiveMonitoring();
             if (liveMonitorEnabled) {
-                statusBar.textContent = 'Live monitoring enabled.';
+                statusBar.textContent = 'Starting live monitor…';
+                updateLiveMonitorStatus({ phase: 'watching', message: 'Starting…' });
             } else {
                 statusBar.textContent = 'Live monitoring disabled.';
+                updateLiveMonitorStatus({ phase: 'idle' });
+            }
+        });
+    }
+
+    if (refreshCacheButton) {
+        refreshCacheButton.addEventListener('click', () => {
+            const selectedDrive = currentRootPath || driveSelect.value;
+            if (!selectedDrive) {
+                statusBar.textContent = 'Please select a drive or load cache first.';
+                return;
+            }
+
+            currentRootPath = selectedDrive;
+            navStack = [];
+            aggregationData.clear();
+
+            beginLongOperation(selectedDrive, 'cache', 'Refreshing cache');
+            scanProgressTitle.textContent = 'Refreshing cache';
+
+            if (pywebview.api.stop_live_updates) {
+                pywebview.api.stop_live_updates();
+            }
+
+            try {
+                pywebview.api.refresh_cache(selectedDrive).then(generation => {
+                    if (generation) {
+                        currentDatasetGeneration = generation;
+                    }
+                });
+            } catch (error) {
+                console.error('Cache refresh error:', error);
+                window.onScanFailed('Cache refresh error: ' + (error.message || error));
             }
         });
     }
@@ -2893,6 +2972,10 @@ chartToggle.addEventListener('change', () => {
 
     // --- GLOBAL CALLBACK FUNCTIONS ---
 
+    window.onLiveMonitorProgress = function(payload) {
+        updateLiveMonitorStatus(payload || {});
+    };
+
     window.onDataChanged_v2 = async function(changedParentDirs) {
         if (isRefreshingLive) return;
         isRefreshingLive = true;
@@ -2974,7 +3057,12 @@ chartToggle.addEventListener('change', () => {
             }
         }
 
-        setTimeout(() => { isRefreshingLive = false; }, 500);
+        setTimeout(() => {
+            isRefreshingLive = false;
+            if (liveMonitorEnabled) {
+                updateLiveMonitorStatus({ phase: 'watching', message: 'Live monitor active' });
+            }
+        }, 500);
     };
 
         

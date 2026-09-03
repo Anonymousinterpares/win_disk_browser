@@ -92,7 +92,7 @@ logging.info(f"Log file: {LOG_FILE_PATH}")
 DATABASE_PATH = os.path.join(APP_DATA_DIR, 'disk_cache_fixed.db')
 scanner = FixedDiskScanner(db_path=DATABASE_PATH)
 logging.info(f"Database file: {DATABASE_PATH}")
-atexit.register(scanner.cache_saver.flush_now)
+atexit.register(lambda: scanner.cache_saver.flush_now(full_snapshot=True))
 
 
 from watchdog.observers import Observer
@@ -365,8 +365,9 @@ class Api:
         # Initialize live update system (new shared system)
         if SHARED_LIVE_UPDATE_AVAILABLE:
             self.live_update_manager = LiveUpdateManager(
-                scanner, 
-                ui_callback=self._on_live_data_changed
+                scanner,
+                ui_callback=self._on_live_data_changed,
+                progress_callback=self._notify_live_progress,
             )
         else:
             self.live_update_manager = None
@@ -1053,37 +1054,14 @@ class Api:
                 generation,
             )
     
-    def _on_live_data_changed(self, changed_paths):
-        """
-        Callback for new shared live update system
-        Forwards to JavaScript using the same method as legacy system
-        """
+
+    def _notify_live_progress(self, payload: dict) -> None:
+        """Push live-monitor status to the frontend."""
         try:
-            logging.info(f"Live data changed via shared system: {len(changed_paths)} paths affected")
-            self._invalidate_top_list_cache()
-            self._schedule_top_list_index_build()
-            
-            # Notify JavaScript about the live updates
-            # Re-use existing JavaScript callback mechanism
-            window.evaluate_js(f'''
-                if (typeof onLiveUpdatesDetected === 'function') {{
-                    onLiveUpdatesDetected({len(changed_paths)});
-                }}
-            ''')
-            
-            # If we have a current root, update the visualization
-            if self._scan_result_root:
-                # Force a refresh of the current view
-                try:
-                    current_data = self.get_data()
-                    if current_data and current_data.get('items'):
-                        window.evaluate_js(f'onScanComplete({json.dumps(current_data)});')
-                except Exception as e:
-                    logging.error(f"Error refreshing view after live updates: {e}")
-                    
-        except Exception as e:
-            logging.error(f"Error in live update callback: {e}")
-    
+            window.evaluate_js(f'onLiveMonitorProgress({json.dumps(payload)})')
+        except Exception as exc:
+            logging.debug(f'Live progress notify failed: {exc}')
+
     def open_location(self, path: str):
         """
         Open the specified file or folder location in Windows Explorer.
@@ -1201,6 +1179,52 @@ class Api:
                     q.append(child)
         return None
 
+    def _live_usn_catchup(self, path: str) -> None:
+        """Background USN sync after live monitor is enabled."""
+        if not self._scan_result_root:
+            return
+        if not is_admin():
+            self._notify_live_progress({
+                'phase': 'watching',
+                'message': 'Live monitor active (run as admin for USN catch-up)',
+            })
+            return
+        try:
+            path = self._normalize_path(os.path.abspath(path))
+            self._notify_live_progress({
+                'phase': 'catchup',
+                'processed': 0,
+                'message': 'Checking for disk changes since last save…',
+            })
+
+            def catchup_progress(current_path: str, items_scanned: int) -> None:
+                self._notify_live_progress({
+                    'phase': 'catchup',
+                    'processed': items_scanned,
+                    'path': current_path,
+                    'message': f'Syncing changed folders… ({items_scanned:,} items processed)',
+                })
+
+            scanner.set_progress_callback(catchup_progress)
+            try:
+                updated = scanner.sync_loaded_tree_from_usn(self._scan_result_root, path)
+                if updated:
+                    self._scan_result_root = updated
+                    scanner.root_node = updated
+            finally:
+                scanner.set_progress_callback(None)
+
+            self._notify_live_progress({
+                'phase': 'watching',
+                'message': 'Live monitor active — up to date',
+            })
+        except Exception as exc:
+            logging.error(f'Live USN catch-up failed: {exc}', exc_info=True)
+            self._notify_live_progress({
+                'phase': 'watching',
+                'message': 'Live monitor active (catch-up skipped)',
+            })
+
     def start_live_updates(self, path: str):
         """API endpoint to start the live file system watcher."""
         if not self._scan_result_root:
@@ -1212,9 +1236,19 @@ class Api:
             if self.live_update_manager.is_monitoring():
                 logging.warning("Shared live update manager is already running.")
                 return True
-            # Set the root_node on the scanner for the live update manager to use
             scanner.root_node = self._scan_result_root
-            return self.live_update_manager.start_monitoring(path)
+            started = self.live_update_manager.start_monitoring(path)
+            if started:
+                self._notify_live_progress({
+                    'phase': 'watching',
+                    'message': 'Live monitor active — watching for changes',
+                })
+                threading.Thread(
+                    target=self._live_usn_catchup,
+                    args=(path,),
+                    daemon=True,
+                ).start()
+            return started
         
         # Fallback to legacy system
         if self.observer and self.observer.is_alive():
@@ -1238,6 +1272,7 @@ class Api:
 
     def stop_live_updates(self):
         """API endpoint to stop the live file system watcher."""
+        self._notify_live_progress({'phase': 'idle', 'message': ''})
         # Try stopping shared live update system first
         if self.live_update_manager and self.live_update_manager.is_monitoring():
             return self.live_update_manager.stop_monitoring()
@@ -1368,7 +1403,8 @@ class Api:
         self._schedule_top_list_index_build()
 
         if self._scan_result_root:
-            scanner.cache_saver.schedule_save(self._scan_result_root)
+            scanner.cache_saver.schedule_save(self._scan_result_root, full_snapshot=False)
+            self._notify_live_progress({'phase': 'saving', 'message': 'Metadata save scheduled…'})
 
         try:
             unique_parents = list(set(changed_parent_dirs))

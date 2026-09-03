@@ -72,7 +72,7 @@ class LiveUpdateManager:
     Unified live update manager that can work with both main UI and visual analyzer
     """
     
-    def __init__(self, scanner, ui_callback: Optional[Callable] = None, ignore_paths: Optional[Set[str]] = None):
+    def __init__(self, scanner, ui_callback: Optional[Callable] = None, ignore_paths: Optional[Set[str]] = None, progress_callback: Optional[Callable] = None):
         """
         Initialize the live update manager
         
@@ -80,9 +80,11 @@ class LiveUpdateManager:
             scanner: FixedDiskScanner instance
             ui_callback: Callback function for UI updates (path_list) -> None
             ignore_paths: Additional paths to ignore (e.g., database, log files)
+            progress_callback: Optional callback for progress updates (dict) -> None
         """
         self.scanner = scanner
         self.ui_callback = ui_callback
+        self.progress_callback = progress_callback
         self.observer: Optional[Any] = None
         self.event_queue = queue.Queue()
         self.live_update_thread: Optional[threading.Thread] = None
@@ -209,8 +211,20 @@ class LiveUpdateManager:
             
         logging.info(f"Processing batch of {len(events)} file system events")
         affected_parents = set()
+
+        if self.progress_callback:
+            try:
+                self.progress_callback({
+                    'phase': 'processing',
+                    'eventsTotal': len(events),
+                    'eventsDone': 0,
+                    'dirsTotal': 0,
+                    'message': f'Processing {len(events)} filesystem change(s)…',
+                })
+            except Exception:
+                pass
         
-        for event in events:
+        for event_idx, event in enumerate(events):
             try:
                 # Get paths to check
                 paths_to_check = [event.src_path]
@@ -239,6 +253,18 @@ class LiveUpdateManager:
                 # Process the event
                 changed_parents = self._process_single_event(event)
                 affected_parents.update(changed_parents)
+
+                if self.progress_callback and (event_idx + 1) % 10 == 0:
+                    try:
+                        self.progress_callback({
+                            'phase': 'processing',
+                            'eventsTotal': len(events),
+                            'eventsDone': event_idx + 1,
+                            'dirsTotal': len(affected_parents),
+                            'message': f'Processing changes… {event_idx + 1}/{len(events)}',
+                        })
+                    except Exception:
+                        pass
                 
             except Exception as e:
                 logging.error(f"Error processing event {event.src_path}: {e}")
@@ -246,7 +272,23 @@ class LiveUpdateManager:
         
         # Notify UI of changes
         if affected_parents:
+            if self.progress_callback:
+                try:
+                    self.progress_callback({
+                        'phase': 'applying',
+                        'eventsTotal': len(events),
+                        'eventsDone': len(events),
+                        'dirsTotal': len(affected_parents),
+                        'message': f'Updating {len(affected_parents)} folder(s)…',
+                    })
+                except Exception:
+                    pass
             self._notify_ui_changes(list(affected_parents))
+        elif self.progress_callback:
+            try:
+                self.progress_callback({'phase': 'watching', 'message': 'Live monitor active'})
+            except Exception:
+                pass
     
     def _process_single_event(self, event) -> Set[str]:
         """
@@ -355,9 +397,17 @@ class LiveUpdateManager:
         """
         logging.info(f"Live data change detected, notifying UI about: {changed_paths}")
         
-        # Save changes to cache (debounced to reduce disk I/O)
+        # Metadata-only save for live updates (full snapshot on scan/exit)
         if self.scanner.root_node:
-            self.scanner.cache_saver.schedule_save(self.scanner.root_node)
+            self.scanner.cache_saver.schedule_save(self.scanner.root_node, full_snapshot=False)
+            if self.progress_callback:
+                try:
+                    self.progress_callback({
+                        'phase': 'saving',
+                        'message': 'Pending metadata save…',
+                    })
+                except Exception:
+                    pass
         
         # Notify UI callback if provided
         if self.ui_callback:

@@ -102,6 +102,73 @@ html, body {
     background-color: #3c3c3c;
     border-top: 1px solid var(--border-color);
     font-size: 0.9em;
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    gap: 12px;
+    min-height: 28px;
+}
+
+#status-bar-text {
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+.live-monitor-status {
+    display: inline-flex;
+    align-items: center;
+    gap: 8px;
+    flex-shrink: 0;
+    color: #9cdcfe;
+    font-size: 0.85em;
+}
+
+.live-monitor-status[hidden] {
+    display: none !important;
+}
+
+.live-monitor-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #4ec9b0;
+    flex-shrink: 0;
+}
+
+.live-monitor-status.phase-processing .live-monitor-dot,
+.live-monitor-status.phase-catchup .live-monitor-dot,
+.live-monitor-status.phase-applying .live-monitor-dot,
+.live-monitor-status.phase-saving .live-monitor-dot {
+    animation: live-monitor-pulse 1s ease-in-out infinite;
+}
+
+.live-monitor-status.phase-processing .live-monitor-dot,
+.live-monitor-status.phase-catchup .live-monitor-dot {
+    background: #dcdcaa;
+}
+
+.live-monitor-status.phase-saving .live-monitor-dot {
+    background: #ce9178;
+}
+
+.live-monitor-progress {
+    color: #aaa;
+    max-width: 280px;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+}
+
+@keyframes live-monitor-pulse {
+    0%, 100% { opacity: 1; transform: scale(1); }
+    50% { opacity: 0.45; transform: scale(0.85); }
+}
+
+#refresh-cache-button:disabled {
+    opacity: 0.5;
 }
 
 /* Toggle Switch CSS */
