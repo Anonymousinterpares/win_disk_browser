@@ -24,7 +24,13 @@ else:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from disk_analyzer_fixed import FixedDiskScanner, FileNode
-from exclude_config import ExcludeConfigError, load_settings, reset_settings, save_excluded
+from exclude_config import (
+    ExcludeConfigError,
+    load_settings,
+    reset_settings,
+    save_columns,
+    save_excluded,
+)
 from name_index import NameIndex
 import colorsys
 from copy import deepcopy
@@ -351,6 +357,44 @@ class NaniteLODSystem:
                     largest_file = child
         return largest_file
 
+
+def _format_attributes(value: int) -> str:
+    """Windows Explorer letters. The directory bit is left out on purpose."""
+    letters = (
+        (0x1, 'R'),
+        (0x2, 'H'),
+        (0x4, 'S'),
+        (0x20, 'A'),
+        (0x800, 'C'),
+        (0x4000, 'E'),
+    )
+    return ''.join(letter for bit, letter in letters if value & bit)
+
+
+def _folder_entry_details(path: str) -> dict:
+    """Live times for one opened folder. The scan cache is not read or written."""
+    details = {}
+    try:
+        with os.scandir(path) as entries:
+            for entry in entries:
+                try:
+                    stat_result = entry.stat(follow_symlinks=False)
+                except OSError:
+                    continue
+                details[entry.name] = {
+                    'created': float(stat_result.st_ctime or 0),
+                    'modified': float(stat_result.st_mtime or 0),
+                    'accessed': float(stat_result.st_atime or 0),
+                    'attributes': _format_attributes(
+                        int(getattr(stat_result, 'st_file_attributes', 0) or 0)
+                    ),
+                }
+    except OSError as exc:
+        logging.debug('Could not read live timestamps for %s: %s', path, exc)
+        return details
+    return details
+
+
 class Api:
     """
     Enhanced API with Nanite-like LOD system for the JavaScript frontend.
@@ -401,7 +445,15 @@ class Api:
                 )
         except Exception:
             logging.exception('Exclude config could not be loaded')
-            self._exclude_settings = {'extensions': [], 'excluded': [], 'corrupted': True}
+            self._exclude_settings = {
+                'extensions': [],
+                'excluded': [],
+                'columns': {
+                    'visible': ['name', 'modified', 'created', 'type', 'size', 'items'],
+                    'widths': {},
+                },
+                'corrupted': True,
+            }
 
     @staticmethod
     def _normalize_path(path: str) -> str:
@@ -1716,11 +1768,33 @@ class Api:
     
     def get_exclude_settings(self) -> Dict:
         """Extensions and which of them are hidden in TreeView. Does not read the database."""
+        columns = self._exclude_settings.get('columns') or {}
         return {
             'extensions': list(self._exclude_settings.get('extensions') or []),
             'excluded': list(self._exclude_settings.get('excluded') or []),
+            'columns': {
+                'visible': list(columns.get('visible') or []),
+                'widths': dict(columns.get('widths') or {}),
+            },
             'corrupted': bool(self._exclude_settings.get('corrupted')),
         }
+
+    def set_column_settings(self, settings) -> Dict:
+        """Save which file-list columns are shown and their dragged widths."""
+        if not isinstance(settings, dict):
+            return {'error': 'Invalid column settings'}
+        try:
+            self._exclude_settings = save_columns(
+                settings.get('visible'),
+                settings.get('widths'),
+            )
+        except ExcludeConfigError as exc:
+            logging.warning('%s', exc)
+            return {'error': str(exc), 'corrupted': True}
+        except Exception as exc:
+            logging.exception('Column settings could not be saved')
+            return {'error': str(exc)}
+        return self.get_exclude_settings()
 
     def set_excluded_extensions(self, excluded) -> Dict:
         """Save ticked types. The scan cache is left untouched."""
@@ -1761,11 +1835,13 @@ class Api:
             start_time = time.time()
             
             contents = []
+            live_details = _folder_entry_details(path)
             
             # Sort children by size (largest first)
             sorted_children = sorted(target_node.children, key=lambda x: x.get_size(), reverse=True)
             
             for child in sorted_children:
+                info = live_details.get(child.name, {})
                 item = {
                     "name": child.name,
                     "path": child.path,
@@ -1773,7 +1849,10 @@ class Api:
                     "size_formatted": self._format_size(child.get_size()),
                     "is_dir": child.is_dir,
                     "type": "Folder" if child.is_dir else self._get_file_type(child.name),
-                    "modified": getattr(child, 'mtime', 0)
+                    "created": info.get('created') or 0,
+                    "modified": info.get('modified') or getattr(child, 'mtime', 0) or 0,
+                    "accessed": info.get('accessed') or 0,
+                    "attributes": info.get('attributes') or '',
                 }
                 
                 # Add additional info for directories

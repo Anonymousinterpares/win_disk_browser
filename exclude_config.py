@@ -6,7 +6,10 @@ import json
 import os
 import sys
 import tempfile
+import threading
 from typing import Iterable, List
+
+_SAVE_LOCK = threading.RLock()
 
 CONFIG_NAME = 'exclude_config.json'
 
@@ -21,6 +24,17 @@ POPULAR_EXTENSIONS = [
     'exe', 'dll', 'msi',
     'iso', 'tmp', 'log', 'ini', 'sys',
 ]
+
+# Name stays first and cannot be hidden. Widths are pixels after the user drags.
+COLUMN_IDS = (
+    'name', 'modified', 'created', 'type', 'size',
+    'accessed', 'attributes', 'items',
+)
+DEFAULT_VISIBLE_COLUMNS = (
+    'name', 'modified', 'created', 'type', 'size', 'items',
+)
+MIN_COLUMN_WIDTH = 48
+MAX_COLUMN_WIDTH = 4000
 
 
 class ExcludeConfigError(Exception):
@@ -59,20 +73,62 @@ def _unique(values: Iterable[object]) -> List[str]:
     return cleaned
 
 
+def default_columns() -> dict:
+    return {
+        'visible': list(DEFAULT_VISIBLE_COLUMNS),
+        'widths': {},
+    }
+
+
 def default_settings() -> dict:
     return {
         'extensions': list(POPULAR_EXTENSIONS),
         'excluded': [],
+        'columns': default_columns(),
     }
 
 
 def _with_flag(settings: dict, corrupted: bool) -> dict:
-    result = {
+    columns = settings.get('columns') or default_columns()
+    return {
         'extensions': list(settings['extensions']),
         'excluded': list(settings['excluded']),
+        'columns': {
+            'visible': list(columns.get('visible') or []),
+            'widths': dict(columns.get('widths') or {}),
+        },
         'corrupted': corrupted,
     }
-    return result
+
+
+def _normalize_columns(raw: object) -> dict:
+    columns = default_columns()
+    if not isinstance(raw, dict):
+        return columns
+    visible = raw.get('visible')
+    # pywebview can turn a one-item list into a string. Keep that single column.
+    if isinstance(visible, str):
+        visible = [visible]
+    if isinstance(visible, list):
+        chosen = {
+            item for item in visible
+            if isinstance(item, str) and item in COLUMN_IDS
+        }
+        chosen.add('name')
+        columns['visible'] = [item for item in COLUMN_IDS if item in chosen]
+    widths = {}
+    if isinstance(raw.get('widths'), dict):
+        for key, value in raw['widths'].items():
+            if key not in COLUMN_IDS:
+                continue
+            try:
+                pixels = int(round(float(value)))
+            except (TypeError, ValueError):
+                continue
+            if MIN_COLUMN_WIDTH <= pixels <= MAX_COLUMN_WIDTH:
+                widths[key] = pixels
+    columns['widths'] = widths
+    return columns
 
 
 def _merge_extensions(from_file: List[str]) -> List[str]:
@@ -100,6 +156,8 @@ def _normalize(raw: object) -> dict:
             settings['extensions'].append(ext)
             known.add(ext)
     settings['excluded'] = [ext for ext in excluded if ext in known]
+    if 'columns' in raw:
+        settings['columns'] = _normalize_columns(raw.get('columns'))
     return settings
 
 
@@ -143,6 +201,11 @@ def load_settings(path: str | None = None, repair: bool = True) -> dict:
 
 
 def save_settings(settings: dict, path: str | None = None) -> dict:
+    with _SAVE_LOCK:
+        return _write_settings(settings, path)
+
+
+def _write_settings(settings: dict, path: str | None = None) -> dict:
     target = path or config_path()
     normalized = _normalize(settings)
     folder = os.path.dirname(target) or '.'
@@ -161,8 +224,30 @@ def save_settings(settings: dict, path: str | None = None) -> dict:
     return normalized
 
 
+def save_columns(visible: object, widths: object, path: str | None = None) -> dict:
+    """Column visibility and dragged widths. Refuses to replace a damaged file."""
+    with _SAVE_LOCK:
+        return _save_columns(visible, widths, path)
+
+
+def _save_columns(visible: object, widths: object, path: str | None = None) -> dict:
+    current = load_settings(path, repair=False)
+    if current.get('corrupted'):
+        raise ExcludeConfigError(
+            'exclude_config.json is damaged and was left unchanged'
+        )
+    current['columns'] = _normalize_columns({'visible': visible, 'widths': widths})
+    saved = save_settings(current, path)
+    return _with_flag(saved, False)
+
+
 def save_excluded(excluded: object, path: str | None = None) -> dict:
     """Tick state only. Refuses to replace a damaged file."""
+    with _SAVE_LOCK:
+        return _save_excluded(excluded, path)
+
+
+def _save_excluded(excluded: object, path: str | None = None) -> dict:
     current = load_settings(path, repair=False)
     if current.get('corrupted'):
         raise ExcludeConfigError(
@@ -181,5 +266,6 @@ def save_excluded(excluded: object, path: str | None = None) -> dict:
 
 def reset_settings(path: str | None = None) -> dict:
     """Replace the file with the hardcoded types and nothing excluded."""
-    saved = save_settings(default_settings(), path)
-    return _with_flag(saved, False)
+    with _SAVE_LOCK:
+        saved = save_settings(default_settings(), path)
+        return _with_flag(saved, False)

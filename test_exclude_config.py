@@ -67,5 +67,61 @@ class ExcludeConfigTests(unittest.TestCase):
                 self.assertEqual(json.load(handle)['extensions'], cfg.POPULAR_EXTENSIONS)
 
 
+    def test_column_visibility_and_widths_round_trip(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, 'exclude_config.json')
+            original = {'extensions': ['heic', 'jpg'], 'excluded': ['heic']}
+            with open(path, 'w', encoding='utf-8') as handle:
+                json.dump(original, handle)
+            loaded = cfg.load_settings(path, repair=False)
+            self.assertEqual(loaded['columns']['visible'], list(cfg.DEFAULT_VISIBLE_COLUMNS))
+            self.assertEqual(loaded['columns']['widths'], {})
+            self.assertEqual(loaded['extensions'][-1], 'heic')
+            self.assertFalse(loaded['corrupted'])
+            with open(path, 'r', encoding='utf-8') as handle:
+                self.assertEqual(json.load(handle), original)
+
+            saved = cfg.save_columns(
+                ['size', 'created'],
+                {
+                    'name': 240,
+                    'type': 48,
+                    'items': 4000,
+                    'modified': 47,
+                    'created': 4001,
+                    'size': 10,
+                    'nope': 100,
+                },
+                path,
+            )
+            self.assertEqual(saved['columns']['visible'], ['name', 'created', 'size'])
+            self.assertEqual(saved['columns']['widths'], {'name': 240, 'type': 48, 'items': 4000})
+            self.assertEqual(saved['excluded'], ['heic'])
+            self.assertEqual(saved['extensions'][-1], 'heic')
+            self.assertIn('sys', saved['extensions'])
+            again = cfg.load_settings(path, repair=False)
+            self.assertEqual(again['columns']['visible'][0], 'name')
+            self.assertIn('created', again['columns']['visible'])
+            self.assertEqual(again['columns']['widths']['name'], 240)
+            self.assertNotIn('size', again['columns']['widths'])
+
+            single = cfg.save_columns('accessed', {'accessed': '180'}, path)
+            self.assertEqual(
+                single['columns']['visible'],
+                ['name', 'accessed'],
+            )
+            self.assertEqual(single['columns']['widths'], {'accessed': 180})
+
+    def test_save_columns_refuses_damaged_file(self):
+        with tempfile.TemporaryDirectory() as folder:
+            path = os.path.join(folder, 'exclude_config.json')
+            with open(path, 'w', encoding='utf-8') as handle:
+                handle.write('{')
+            with self.assertRaises(cfg.ExcludeConfigError):
+                cfg.save_columns(['name', 'size'], {'name': 200}, path)
+            with open(path, 'r', encoding='utf-8') as handle:
+                self.assertEqual(handle.read(), '{')
+
+
 if __name__ == '__main__':
     unittest.main()

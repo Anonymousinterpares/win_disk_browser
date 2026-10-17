@@ -41,6 +41,23 @@ window.addEventListener('pywebviewready', function() {
     const excludeBody = document.getElementById('exclude-body');
     let excludedExtensions = new Set();
     let excludeSaveQueue = Promise.resolve();
+    const FILE_COLUMNS = [
+        { id: 'name', label: 'Name', defaultWidth: 160 },
+        { id: 'modified', label: 'Date modified', defaultWidth: 168 },
+        { id: 'created', label: 'Date created', defaultWidth: 168 },
+        { id: 'type', label: 'Type', defaultWidth: 130 },
+        { id: 'size', label: 'Size', defaultWidth: 96 },
+        { id: 'accessed', label: 'Date accessed', defaultWidth: 168 },
+        { id: 'attributes', label: 'Attributes', defaultWidth: 110 },
+        { id: 'items', label: 'Items', defaultWidth: 170 }
+    ];
+    const DEFAULT_VISIBLE_COLUMNS = ['name', 'modified', 'created', 'type', 'size', 'items'];
+    let columnVisible = DEFAULT_VISIBLE_COLUMNS.slice();
+    let columnWidths = {};
+    let suppressHeaderSortUntil = 0;
+    const columnPickerBtn = document.getElementById('column-picker-btn');
+    const columnPicker = document.getElementById('column-picker');
+    const nameHoverTip = document.getElementById('name-hover-tip');
     const scanProgressOverlay = document.getElementById('scan-progress-overlay');
     const scanProgressTitle = document.getElementById('scan-progress-title');
     const scanProgressBar = document.getElementById('scan-progress-bar');
@@ -2082,6 +2099,209 @@ chartToggle.addEventListener('change', () => {
         }
     }
     
+    function formatTimestamp(value) {
+        const seconds = Number(value);
+        if (!Number.isFinite(seconds) || seconds <= 0) return '';
+        const date = new Date(seconds * 1000);
+        if (Number.isNaN(date.getTime())) return '';
+        return date.toLocaleString(undefined, {
+            year: 'numeric',
+            month: '2-digit',
+            day: '2-digit',
+            hour: '2-digit',
+            minute: '2-digit'
+        });
+    }
+
+    function columnCellText(item, id) {
+        switch (id) {
+            case 'size':
+                return item.size_formatted || '';
+            case 'type':
+                return item.type || '';
+            case 'items':
+                return item.items_text || '';
+            case 'modified':
+                return formatTimestamp(item.modified);
+            case 'created':
+                return formatTimestamp(item.created);
+            case 'accessed':
+                return formatTimestamp(item.accessed);
+            case 'attributes':
+                return item.attributes || '';
+            default:
+                return '';
+        }
+    }
+
+    function widthFor(id) {
+        const saved = Number(columnWidths[id]);
+        if (Number.isFinite(saved) && saved >= 48 && saved <= 4000) {
+            return Math.round(saved);
+        }
+        if (id === 'name') {
+            const panel = document.querySelector('.file-panel') || document.getElementById('file-list');
+            const available = panel ? panel.clientWidth : 0;
+            return Math.max(160, Math.round(available * 0.5));
+        }
+        const spec = FILE_COLUMNS.find(col => col.id === id);
+        return spec ? spec.defaultWidth : 120;
+    }
+
+    function syncTableWidth(table) {
+        if (!table) return;
+        const sum = columnVisible.reduce((total, id) => total + widthFor(id), 0);
+        table.style.width = sum + 'px';
+    }
+
+    function hideNameTip() {
+        if (nameHoverTip) nameHoverTip.hidden = true;
+    }
+
+    function showNameTip(nameEl) {
+        if (!nameHoverTip || !nameEl) return;
+        if (nameEl.scrollWidth <= nameEl.clientWidth + 1) {
+            nameHoverTip.hidden = true;
+            return;
+        }
+        nameHoverTip.textContent = nameEl.textContent || '';
+        nameHoverTip.hidden = false;
+        const rect = nameEl.getBoundingClientRect();
+        let left = rect.left;
+        let top = rect.bottom + 4;
+        nameHoverTip.style.left = left + 'px';
+        nameHoverTip.style.top = top + 'px';
+        const tipRect = nameHoverTip.getBoundingClientRect();
+        if (left + tipRect.width > window.innerWidth - 8) {
+            left = Math.max(8, window.innerWidth - 8 - tipRect.width);
+        }
+        if (top + tipRect.height > window.innerHeight - 8) {
+            top = Math.max(8, rect.top - tipRect.height - 4);
+        }
+        nameHoverTip.style.left = left + 'px';
+        nameHoverTip.style.top = top + 'px';
+    }
+
+    function persistColumns() {
+        const snapshot = {
+            visible: columnVisible.slice(),
+            widths: Object.assign({}, columnWidths)
+        };
+        excludeSaveQueue = excludeSaveQueue
+            .catch(() => {})
+            .then(() => pywebview.api.set_column_settings(snapshot))
+            .then(result => {
+                if (result && result.corrupted) {
+                    statusBar.textContent = 'exclude_config.json is damaged and was left unchanged.';
+                    return;
+                }
+                if (!result || result.error) {
+                    statusBar.textContent = 'Could not save column settings.';
+                }
+            })
+            .catch(() => {
+                statusBar.textContent = 'Could not save column settings.';
+            });
+    }
+
+    function renderColumnPicker() {
+        if (!columnPicker) return;
+        columnPicker.replaceChildren();
+        FILE_COLUMNS.forEach(col => {
+            const label = document.createElement('label');
+            label.className = 'column-picker-item' + (col.id === 'name' ? ' locked' : '');
+            const box = document.createElement('input');
+            box.type = 'checkbox';
+            box.checked = columnVisible.indexOf(col.id) !== -1;
+            box.disabled = col.id === 'name';
+            if (col.id !== 'name') {
+                box.addEventListener('change', () => {
+                    const chosen = new Set(columnVisible);
+                    if (box.checked) chosen.add(col.id);
+                    else chosen.delete(col.id);
+                    chosen.add('name');
+                    columnVisible = FILE_COLUMNS.map(item => item.id).filter(id => chosen.has(id));
+                    persistColumns();
+                    if (treeViewOperationState.currentContents) {
+                        renderDirectoryContents(treeViewOperationState.currentContents);
+                    }
+                });
+            }
+            label.appendChild(box);
+            label.appendChild(document.createTextNode(col.label));
+            columnPicker.appendChild(label);
+        });
+    }
+
+    function applyColumnSettings(columns) {
+        const known = new Set(FILE_COLUMNS.map(col => col.id));
+        const incoming = columns && Array.isArray(columns.visible)
+            ? columns.visible
+            : DEFAULT_VISIBLE_COLUMNS;
+        const chosen = new Set(incoming.filter(id => known.has(id)));
+        chosen.add('name');
+        columnVisible = FILE_COLUMNS.map(col => col.id).filter(id => chosen.has(id));
+        columnWidths = {};
+        const rawWidths = (columns && columns.widths) || {};
+        Object.keys(rawWidths).forEach(id => {
+            const pixels = Number(rawWidths[id]);
+            if (!known.has(id) || !Number.isFinite(pixels)) return;
+            const rounded = Math.round(pixels);
+            if (rounded >= 48 && rounded <= 4000) columnWidths[id] = rounded;
+        });
+        renderColumnPicker();
+    }
+
+    function placeColumnPicker() {
+        if (!columnPickerBtn || !columnPicker) return;
+        const rect = columnPickerBtn.getBoundingClientRect();
+        columnPicker.style.left = rect.left + 'px';
+        columnPicker.style.top = (rect.bottom + 4) + 'px';
+    }
+
+    function setColumnPickerOpen(open) {
+        if (!columnPicker || !columnPickerBtn) return;
+        columnPicker.hidden = !open;
+        columnPickerBtn.setAttribute('aria-expanded', open ? 'true' : 'false');
+        if (open) placeColumnPicker();
+    }
+
+    function bindColumnResize(handle, id) {
+        handle.addEventListener('mousedown', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+            const table = handle.closest('table');
+            const col = table ? table.querySelector('col[data-column="' + id + '"]') : null;
+            const header = handle.closest('th');
+            const startX = event.clientX;
+            const startWidth = col ? col.getBoundingClientRect().width : widthFor(id);
+            let moved = false;
+            function onMove(moveEvent) {
+                const next = Math.round(Math.min(4000, Math.max(48, startWidth + (moveEvent.clientX - startX))));
+                if (Math.abs(moveEvent.clientX - startX) > 2) moved = true;
+                const px = next + 'px';
+                if (col) col.style.width = px;
+                if (header) header.style.width = px;
+                columnWidths[id] = next;
+                syncTableWidth(table);
+            }
+            function onUp() {
+                document.removeEventListener('mousemove', onMove);
+                document.removeEventListener('mouseup', onUp);
+                if (moved) {
+                    suppressHeaderSortUntil = Date.now() + 300;
+                    persistColumns();
+                }
+            }
+            document.addEventListener('mousemove', onMove);
+            document.addEventListener('mouseup', onUp);
+        });
+        handle.addEventListener('click', (event) => {
+            event.preventDefault();
+            event.stopPropagation();
+        });
+    }
+
     function renderDirectoryContents(contents) {
         treeViewDebug.log('renderDirectoryContents called with', contents?.length || 0, 'items');
         treeViewDebug.time('renderDirectoryContents');
@@ -2098,6 +2318,7 @@ chartToggle.addEventListener('change', () => {
         try {
             // Clear existing contents and any attached event listeners
             treeViewDebug.time('DOM Cleanup');
+            hideNameTip();
             fileListContainer.innerHTML = '';
             treeViewDebug.timeEnd('DOM Cleanup');
             
@@ -2120,63 +2341,94 @@ chartToggle.addEventListener('change', () => {
             treeViewDebug.time('Table Creation');
             const table = document.createElement('table');
             table.className = 'file-list-table';
-            
-            // Create sortable header
-            const thead = document.createElement('thead');
-            thead.innerHTML = `
-                <tr>
-                    <th class="name-column sortable-header" data-sort="name">
-                        Name <span class="sort-arrow"></span>
-                    </th>
-                    <th class="size-column sortable-header" data-sort="size">
-                        Size <span class="sort-arrow"></span>
-                    </th>
-                    <th class="type-column sortable-header" data-sort="type">
-                        Type <span class="sort-arrow"></span>
-                    </th>
-                    <th class="items-column sortable-header" data-sort="items">
-                        Items <span class="sort-arrow"></span>
-                    </th>
-                </tr>
-            `;
-            table.appendChild(thead);
-            
-            // Add click handlers to sortable headers
-            thead.querySelectorAll('.sortable-header').forEach(header => {
-                header.addEventListener('click', () => {
-                    const sortColumn = header.dataset.sort;
-                    handleColumnSort(sortColumn);
-                });
+            const colgroup = document.createElement('colgroup');
+            columnVisible.forEach(id => {
+                const col = document.createElement('col');
+                col.dataset.column = id;
+                col.style.width = widthFor(id) + 'px';
+                colgroup.appendChild(col);
             });
-            
-            // Create body
+            const fillerCol = document.createElement('col');
+            fillerCol.className = 'col-filler';
+            colgroup.appendChild(fillerCol);
+            table.appendChild(colgroup);
+            syncTableWidth(table);
+
+            const thead = document.createElement('thead');
+            const headerRow = document.createElement('tr');
+            columnVisible.forEach(id => {
+                const spec = FILE_COLUMNS.find(col => col.id === id);
+                const th = document.createElement('th');
+                th.className = id + '-column sortable-header';
+                th.dataset.sort = id;
+                th.style.width = widthFor(id) + 'px';
+                const label = document.createElement('span');
+                label.className = 'col-label';
+                label.textContent = spec ? spec.label : id;
+                const arrow = document.createElement('span');
+                arrow.className = 'sort-arrow';
+                const handle = document.createElement('span');
+                handle.className = 'col-resize';
+                handle.title = 'Drag to resize';
+                th.appendChild(label);
+                th.appendChild(document.createTextNode(' '));
+                th.appendChild(arrow);
+                th.appendChild(handle);
+                th.addEventListener('click', (event) => {
+                    if (Date.now() < suppressHeaderSortUntil) return;
+                    if (event.target.classList.contains('col-resize')) return;
+                    handleColumnSort(id);
+                });
+                bindColumnResize(handle, id);
+                headerRow.appendChild(th);
+            });
+            const fillerHeader = document.createElement('th');
+            fillerHeader.className = 'filler-header';
+            headerRow.appendChild(fillerHeader);
+            thead.appendChild(headerRow);
+            table.appendChild(thead);
+
             const tbody = document.createElement('tbody');
             treeViewDebug.timeEnd('Table Creation');
-            
+
             treeViewDebug.time('Row Creation');
             sortedContents.forEach((item, index) => {
-            const row = document.createElement('tr');
-            row.className = item.is_dir ? 'folder-row' : 'file-row';
-            row.dataset.path = item.path;
-            row.dataset.isDir = item.is_dir;
-            
-            row.innerHTML = `
-                <td class="name-cell">
-                    <span class="file-icon">${item.is_dir ? '📁' : '📄'}</span>
-                    <span class="file-name">${item.name}</span>
-                </td>
-                <td class="size-cell">${item.size_formatted}</td>
-                <td class="type-cell">${item.type}</td>
-                <td class="items-cell">${item.items_text}</td>
-            `;
-            
-            // Generate unique row ID for debugging
-            const rowId = `row-${index}-${item.name}`;
-            row.setAttribute('data-row-id', rowId);
-            
-            // Add comprehensive event handlers with debugging
-            addTreeViewEventHandlers(row, item, rowId);
-            
+                const row = document.createElement('tr');
+                row.className = item.is_dir ? 'folder-row' : 'file-row';
+                row.dataset.path = item.path;
+                row.dataset.isDir = item.is_dir;
+                let nameEl = null;
+                columnVisible.forEach(id => {
+                    const td = document.createElement('td');
+                    td.className = id + '-cell';
+                    if (id === 'name') {
+                        const inner = document.createElement('div');
+                        inner.className = 'name-cell-inner';
+                        const icon = document.createElement('span');
+                        icon.className = 'file-icon';
+                        icon.textContent = item.is_dir ? '📁' : '📄';
+                        nameEl = document.createElement('span');
+                        nameEl.className = 'file-name';
+                        nameEl.textContent = item.name || '';
+                        inner.appendChild(icon);
+                        inner.appendChild(nameEl);
+                        td.appendChild(inner);
+                    } else {
+                        td.textContent = columnCellText(item, id);
+                    }
+                    row.appendChild(td);
+                });
+                const fillerCell = document.createElement('td');
+                fillerCell.className = 'filler-cell';
+                row.appendChild(fillerCell);
+
+                const rowId = `row-${index}-${item.name}`;
+                row.setAttribute('data-row-id', rowId);
+                if (nameEl) {
+                    row.addEventListener('mouseenter', () => showNameTip(nameEl));
+                    row.addEventListener('mouseleave', hideNameTip);
+                }
+                addTreeViewEventHandlers(row, item, rowId);
                 tbody.appendChild(row);
             });
             treeViewDebug.timeEnd('Row Creation');
@@ -2295,6 +2547,7 @@ chartToggle.addEventListener('change', () => {
 
     function applyExcludeSettings(settings) {
         renderExcludeTypes(settings.extensions || [], settings.excluded || []);
+        applyColumnSettings(settings.columns);
         if (treeViewOperationState.currentContents) {
             renderDirectoryContents(treeViewOperationState.currentContents);
         }
@@ -2381,6 +2634,16 @@ chartToggle.addEventListener('change', () => {
                     const bCount = b.is_dir ? (b.file_count || 0) + (b.dir_count || 0) : 0;
                     compareResult = aCount - bCount;
                     break;
+
+                case 'modified':
+                case 'created':
+                case 'accessed':
+                    compareResult = (Number(a[column]) || 0) - (Number(b[column]) || 0);
+                    break;
+
+                case 'attributes':
+                    compareResult = (a.attributes || '').localeCompare(b.attributes || '');
+                    break;
                     
                 default:
                     compareResult = 0;
@@ -2400,10 +2663,11 @@ chartToggle.addEventListener('change', () => {
         headers.forEach(header => {
             const arrow = header.querySelector('.sort-arrow');
             const column = header.dataset.sort;
-            
+            if (!arrow) return;
+
             // Remove existing classes
             header.classList.remove('sort-active', 'sort-asc', 'sort-desc');
-            
+
             if (column === treeViewOperationState.sortColumn && treeViewOperationState.sortDirection) {
                 header.classList.add('sort-active', `sort-${treeViewOperationState.sortDirection}`);
                 arrow.textContent = treeViewOperationState.sortDirection === 'asc' ? '▲' : '▼';
@@ -3495,6 +3759,37 @@ chartToggle.addEventListener('change', () => {
         const open = excludeToggle.getAttribute('aria-expanded') === 'true';
         setExcludeOpen(!open);
     });
+    renderColumnPicker();
+    if (columnPickerBtn) {
+        columnPickerBtn.addEventListener('click', (event) => {
+            event.stopPropagation();
+            setColumnPickerOpen(columnPicker.hidden);
+        });
+    }
+    document.addEventListener('click', (event) => {
+        if (!columnPicker || columnPicker.hidden) return;
+        if (event.target === columnPickerBtn || columnPicker.contains(event.target)) return;
+        setColumnPickerOpen(false);
+    });
+    const fileListEl = document.getElementById('file-list');
+    if (fileListEl) {
+        fileListEl.addEventListener('scroll', hideNameTip);
+        const filePanelEl = document.querySelector('.file-panel');
+        if (window.ResizeObserver && filePanelEl) {
+            const nameWidthObserver = new ResizeObserver(() => {
+                if (columnWidths.name) return;
+                const table = fileListEl.querySelector('.file-list-table');
+                if (!table) return;
+                const px = widthFor('name') + 'px';
+                const col = table.querySelector('col[data-column="name"]');
+                const th = table.querySelector('th[data-sort="name"]');
+                if (col) col.style.width = px;
+                if (th) th.style.width = px;
+                syncTableWidth(table);
+            });
+            nameWidthObserver.observe(filePanelEl);
+        }
+    }
     loadExcludeSettings();
     setTreemapMode('treeview');
     
