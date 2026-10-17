@@ -1527,10 +1527,24 @@ chartContainer.addEventListener('wheel', function(event) {
         }
     });
 
-    // Search functionality
+    // Search functionality. * is the wildcard: report*, *.pdf, *cache*, rep*2024*.pdf
+    let searchKind = 'both';
     const debouncedSearch = debounce((query) => {
-        pywebview.api.search_nodes(query).then(displaySearchResults);
-    }, 300);
+        pywebview.api.search_nodes(query, searchKind).then(displaySearchResults);
+    }, 60);
+
+    document.querySelectorAll('.search-kind button').forEach((button) => {
+        button.addEventListener('click', () => {
+            searchKind = button.dataset.kind || 'both';
+            document.querySelectorAll('.search-kind button').forEach((other) => {
+                other.classList.toggle('active', other === button);
+            });
+            const query = searchInput.value.trim();
+            if (query.length >= 2) {
+                pywebview.api.search_nodes(query, searchKind).then(displaySearchResults);
+            }
+        });
+    });
 
     searchInput.addEventListener('input', () => {
         const query = searchInput.value.trim();
@@ -1541,25 +1555,72 @@ chartContainer.addEventListener('wheel', function(event) {
         debouncedSearch(query);
     });
 
-    function displaySearchResults(results) {
+    function escapeHtml(value) {
+        return String(value)
+            .replace(/&/g, '&amp;')
+            .replace(/</g, '&lt;')
+            .replace(/>/g, '&gt;')
+            .replace(/"/g, '&quot;');
+    }
+
+    function displaySearchResults(payload) {
+        const results = Array.isArray(payload) ? payload : ((payload && payload.results) || []);
+        const total = Array.isArray(payload) ? results.length : ((payload && payload.total) || 0);
+        const partial = !Array.isArray(payload) && payload && payload.partial;
+        const expanded = !Array.isArray(payload) && payload && payload.expanded;
+        const message = !Array.isArray(payload) && payload ? (payload.message || '') : '';
+
         searchResultsContainer.innerHTML = '';
-        
+
+        const notes = [];
+        if (message) {
+            notes.push(message);
+        }
+        if (expanded) {
+            notes.push('No exact name. Showing names that contain this text.');
+        }
+        if (results.length > 0 && total > results.length) {
+            notes.push(`Showing ${results.length.toLocaleString()} of ${total.toLocaleString()}`);
+        } else if (results.length > 0 && total > 1) {
+            notes.push(`${total.toLocaleString()} matches`);
+        }
+        if (partial && results.length > 0) {
+            notes.push('Partial index. Run as administrator and Scan Fresh to include skipped folders such as node_modules.');
+        }
+        if (notes.length > 0) {
+            const meta = document.createElement('div');
+            meta.className = 'search-meta';
+            meta.textContent = notes.join(' ');
+            searchResultsContainer.appendChild(meta);
+        }
+
         if (results.length === 0) {
-            searchResultsContainer.innerHTML = '<div class="no-results">No results found.</div>';
+            const empty = document.createElement('div');
+            empty.className = 'no-results';
+            empty.textContent = message ? '' : 'No results found.';
+            if (!message) {
+                searchResultsContainer.appendChild(empty);
+            }
         } else {
             results.forEach(item => {
                 const resultItem = document.createElement('div');
                 resultItem.className = 'search-result-item';
+                const kindLabel = item.is_dir ? 'Folder' : 'File';
                 resultItem.innerHTML = `
-                    <span class="name">${item.name}</span>
-                    <span class="path">${item.path}</span>
+                    <span class="search-badge">${kindLabel}</span>
+                    <span class="name">${escapeHtml(item.name)}</span>
+                    <span class="path">${escapeHtml(item.path)}</span>
                     <span class="size">${formatSize(item.value)}</span>
                 `;
                 resultItem.addEventListener('click', () => {
-                    const parentPath = item.path.substring(0, item.path.lastIndexOf('\\'));
-                    if (parentPath) {
+                    let target = item.path;
+                    if (!item.is_dir) {
+                        const slash = item.path.lastIndexOf('\\');
+                        target = slash > 0 ? item.path.substring(0, slash) : item.path;
+                    }
+                    if (target) {
                         setTreemapMode('structure');
-                        requestStructureView(parentPath || item.path);
+                        requestStructureView(target);
                     }
                     searchInput.value = '';
                     searchResultsContainer.style.display = 'none';
@@ -1567,7 +1628,7 @@ chartContainer.addEventListener('wheel', function(event) {
                 searchResultsContainer.appendChild(resultItem);
             });
         }
-        
+
         searchResultsContainer.style.display = 'block';
     }
 

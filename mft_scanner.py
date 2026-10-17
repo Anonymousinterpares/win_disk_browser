@@ -1,13 +1,14 @@
 """
-NTFS MFT fast scan — reads the Master File Table sequentially from the volume.
+NTFS MFT fast scan — reads the Master File Table in logical record order.
 
 Requires administrator privileges on NTFS volumes. Falls back to directory walking
-when unavailable. Approach aligned with WizTree / DiskSleuth: one sequential read
-pass over MFT records instead of per-path directory traversal.
+when unavailable. $MFT is often several physical runs; record numbers are positions
+in that logical file, so reading only the first run drops later folders.
 """
 
 from __future__ import annotations
 
+import ctypes
 import logging
 import os
 import struct
@@ -30,11 +31,24 @@ ATTR_STANDARD_INFORMATION = 0x10
 ATTR_FILE_NAME = 0x30
 ATTR_END = 0xFFFFFFFF
 
-FILE_NAME_WIN32 = 0x01
 FILE_NAME_POSIX = 0x00
+FILE_NAME_WIN32 = 0x01
+FILE_NAME_DOS = 0x02
+FILE_NAME_WIN32_DOS = 0x03
+ATTR_DATA = 0x80
+ATTR_ATTRIBUTE_LIST = 0x20
+
+# Win32 names win over a POSIX alias. A name that fits in 8.3 is stored once
+# as Win32+DOS (3), not as plain Win32 (1). DOS-only is the last resort.
+_NAMESPACE_RANK = {
+    FILE_NAME_DOS: 1,
+    FILE_NAME_POSIX: 2,
+    FILE_NAME_WIN32: 3,
+    FILE_NAME_WIN32_DOS: 3,
+}
 
 PROGRESS_INTERVAL = 0.1
-MFT_READ_CHUNK_RECORDS = 512
+MFT_READ_CHUNK_RECORDS = 4096
 
 
 @dataclass
@@ -43,6 +57,7 @@ class VolumeGeometry:
     bytes_per_cluster: int
     bytes_per_file_record: int
     mft_start_lcn: int
+    mft_valid_data_length: int
 
 
 @dataclass
@@ -108,31 +123,47 @@ def _get_volume_geometry(handle) -> Optional[VolumeGeometry]:
         bytes_per_sector = struct.unpack_from('<I', data, 40)[0]
         bytes_per_cluster = struct.unpack_from('<I', data, 44)[0]
         bytes_per_file_record = struct.unpack_from('<I', data, 48)[0]
+        mft_valid_data_length = struct.unpack_from('<Q', data, 56)[0]
         mft_start_lcn = struct.unpack_from('<Q', data, 64)[0]
-        if bytes_per_file_record <= 0 or bytes_per_cluster <= 0:
+        if bytes_per_file_record <= 0 or bytes_per_cluster <= 0 or bytes_per_sector <= 0:
             return None
         return VolumeGeometry(
             bytes_per_sector=bytes_per_sector,
             bytes_per_cluster=bytes_per_cluster,
             bytes_per_file_record=bytes_per_file_record,
             mft_start_lcn=mft_start_lcn,
+            mft_valid_data_length=mft_valid_data_length,
         )
     except Exception as exc:
         logging.debug(f'FSCTL_GET_NTFS_VOLUME_DATA failed: {exc}')
         return None
 
 
-def _apply_fixup(record: bytearray, geometry: VolumeGeometry) -> None:
-    usa_offset = struct.unpack_from('<H', record, 4)[0]
-    usa_count = struct.unpack_from('<H', record, 6)[0]
-    if usa_offset == 0 or usa_count < 2:
-        return
+def _apply_fixup(record: bytearray, geometry: VolumeGeometry) -> bool:
+    """Restore the bytes NTFS replaced with the update sequence. False if unusable."""
+    if len(record) < 42 or record[:4] != b'FILE':
+        return False
+    usa_offset, usa_count = struct.unpack_from('<HH', record, 4)
     sector_size = geometry.bytes_per_sector
+    if sector_size < 2 or len(record) % sector_size != 0:
+        return False
+    expected = len(record) // sector_size + 1
+    if usa_count != expected or usa_offset < 42:
+        return False
+    if usa_offset + usa_count * 2 > len(record):
+        return False
     update_seq = struct.unpack_from('<H', record, usa_offset)[0]
     for sector_idx in range(1, usa_count):
         patch_offset = sector_idx * sector_size - 2
-        if 0 <= patch_offset + 1 < len(record):
-            struct.pack_into('<H', record, patch_offset, update_seq)
+        if struct.unpack_from('<H', record, patch_offset)[0] != update_seq:
+            return False
+        struct.pack_into(
+            '<H',
+            record,
+            patch_offset,
+            struct.unpack_from('<H', record, usa_offset + sector_idx * 2)[0],
+        )
+    return True
 
 
 def _iter_attributes(record: bytes, first_attr_offset: int):
@@ -218,7 +249,7 @@ def _parse_file_record(
 
     parent_index = 0
     name = ''
-    name_type = -1
+    name_rank = 0
     size = 0
     mtime = 0.0
 
@@ -228,10 +259,11 @@ def _parse_file_record(
             if not parsed:
                 continue
             parent_frn, candidate_name, candidate_size, candidate_mtime, candidate_type = parsed
-            if candidate_type in (FILE_NAME_WIN32, FILE_NAME_POSIX) and candidate_type >= name_type:
+            rank = _NAMESPACE_RANK.get(candidate_type, 0)
+            if rank >= name_rank and rank > 0:
                 parent_index = mft_index(parent_frn)
                 name = candidate_name
-                name_type = candidate_type
+                name_rank = rank
                 if not is_dir:
                     size = candidate_size
                 mtime = candidate_mtime
@@ -259,46 +291,412 @@ def _parse_file_record(
     )
 
 
+def _kernel32():
+    kernel = getattr(_kernel32, '_dll', None)
+    if kernel is not None:
+        return kernel
+    kernel = ctypes.WinDLL('kernel32', use_last_error=True)
+    kernel.SetFilePointerEx.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_longlong,
+        ctypes.POINTER(ctypes.c_longlong),
+        ctypes.c_uint32,
+    ]
+    kernel.SetFilePointerEx.restype = ctypes.c_int
+    kernel.GetFileSizeEx.argtypes = [
+        ctypes.c_void_p,
+        ctypes.POINTER(ctypes.c_ulonglong),
+    ]
+    kernel.GetFileSizeEx.restype = ctypes.c_int
+    _kernel32._dll = kernel
+    return kernel
+
+
+def _file_size(handle) -> int:
+    size = ctypes.c_ulonglong(0)
+    if not _kernel32().GetFileSizeEx(int(handle), ctypes.byref(size)):
+        return 0
+    return int(size.value)
+
+
+def _seek(handle, offset: int) -> None:
+    new_pos = ctypes.c_longlong()
+    ok = _kernel32().SetFilePointerEx(
+        int(handle),
+        ctypes.c_longlong(offset),
+        ctypes.byref(new_pos),
+        win32con.FILE_BEGIN,
+    )
+    if not ok:
+        raise OSError(ctypes.get_last_error(), 'SetFilePointerEx failed')
+
+
+def _parse_data_runs(run_bytes: bytes) -> List[Tuple[int, int]]:
+    """Decode a non-resident run list into (lcn, cluster_count). Sparse lcn is -1."""
+    runs: List[Tuple[int, int]] = []
+    pos = 0
+    lcn = 0
+    size = len(run_bytes)
+    while pos < size:
+        header = run_bytes[pos]
+        pos += 1
+        if header == 0:
+            break
+        len_size = header & 0x0F
+        off_size = (header >> 4) & 0x0F
+        if len_size == 0 or pos + len_size + off_size > size:
+            break
+        count = int.from_bytes(run_bytes[pos:pos + len_size], 'little')
+        pos += len_size
+        if count <= 0:
+            break
+        if off_size == 0:
+            runs.append((-1, count))
+            continue
+        delta = int.from_bytes(run_bytes[pos:pos + off_size], 'little')
+        pos += off_size
+        sign = 1 << (off_size * 8 - 1)
+        if delta & sign:
+            delta -= 1 << (off_size * 8)
+        lcn += delta
+        if lcn < 0:
+            break
+        runs.append((lcn, count))
+    return runs
+
+
+def _unnamed_data_runs(record: bytes) -> Optional[bytes]:
+    """Raw run list of the unnamed non-resident $DATA attribute, if this record has one."""
+    if len(record) < 0x40 or record[:4] != b'FILE':
+        return None
+    first_attr = struct.unpack_from('<H', record, 0x14)[0]
+    for attr_type, attr in _iter_attributes(record, first_attr):
+        if attr_type != ATTR_DATA or len(attr) < 0x40:
+            continue
+        if attr[8] != 1 or attr[9] != 0:
+            continue
+        runs_off = struct.unpack_from('<H', attr, 0x20)[0]
+        if runs_off >= len(attr):
+            continue
+        return attr[runs_off:]
+    return None
+
+
+def _attribute_list_targets(record: bytes) -> List[Tuple[int, int]]:
+    """(starting_vcn, mft_record) for unnamed $DATA pieces stored outside this record."""
+    if len(record) < 0x40 or record[:4] != b'FILE':
+        return []
+    first_attr = struct.unpack_from('<H', record, 0x14)[0]
+    targets: List[Tuple[int, int]] = []
+    for attr_type, attr in _iter_attributes(record, first_attr):
+        if attr_type != ATTR_ATTRIBUTE_LIST or attr[8] != 0:
+            continue
+        value_length = struct.unpack_from('<I', attr, 0x10)[0]
+        value_offset = struct.unpack_from('<H', attr, 0x14)[0]
+        if value_offset + value_length > len(attr):
+            continue
+        value = attr[value_offset:value_offset + value_length]
+        pos = 0
+        while pos + 26 <= len(value):
+            entry_type, entry_len = struct.unpack_from('<IH', value, pos)
+            if entry_len < 26 or pos + entry_len > len(value):
+                break
+            name_len = value[pos + 6]
+            starting_vcn = struct.unpack_from('<Q', value, pos + 8)[0]
+            file_ref = struct.unpack_from('<Q', value, pos + 16)[0]
+            if entry_type == ATTR_DATA and name_len == 0 and starting_vcn > 0:
+                targets.append((starting_vcn, mft_index(file_ref)))
+            pos += entry_len
+    targets.sort()
+    return targets
+
+
+def _record_disk_offset(
+    runs: List[Tuple[int, int]],
+    record_index: int,
+    geometry: VolumeGeometry,
+) -> Optional[int]:
+    record_size = geometry.bytes_per_file_record
+    cluster_size = geometry.bytes_per_cluster
+    if record_size <= 0 or cluster_size < record_size:
+        return None
+    records_per_cluster = cluster_size // record_size
+    remaining = record_index
+    for lcn, clusters in runs:
+        records_in_run = clusters * records_per_cluster
+        if remaining < records_in_run:
+            if lcn < 0:
+                return None
+            cluster_index = remaining // records_per_cluster
+            within = remaining % records_per_cluster
+            return (lcn + cluster_index) * cluster_size + within * record_size
+        remaining -= records_in_run
+    return None
+
+
+def _note_progress(
+    progress_callback: Optional[Callable[[str, int], None]],
+    record_index: int,
+    last_progress: List[float],
+) -> None:
+    if progress_callback is None:
+        return
+    now = time.time()
+    if now - last_progress[0] < PROGRESS_INTERVAL:
+        return
+    progress_callback(f'MFT record {record_index:,}', record_index)
+    last_progress[0] = now
+
+
+def _ingest_buffer(
+    data: bytes,
+    geometry: VolumeGeometry,
+    record_index: int,
+    entries: Dict[int, MftEntry],
+    progress_callback: Optional[Callable[[str, int], None]],
+    last_progress: List[float],
+) -> int:
+    record_size = geometry.bytes_per_file_record
+    usable = len(data) - (len(data) % record_size)
+    for offset in range(0, usable, record_size):
+        raw = bytearray(data[offset:offset + record_size])
+        try:
+            if _apply_fixup(raw, geometry):
+                entry = _parse_file_record(bytes(raw), record_index, geometry)
+                if entry:
+                    entries[record_index] = entry
+        except Exception:
+            pass
+        record_index += 1
+        _note_progress(progress_callback, record_index, last_progress)
+    return record_index
+
+
+def _ingest_handle(
+    handle,
+    byte_length: int,
+    geometry: VolumeGeometry,
+    record_index: int,
+    entries: Dict[int, MftEntry],
+    progress_callback: Optional[Callable[[str, int], None]],
+    last_progress: List[float],
+) -> int:
+    record_size = geometry.bytes_per_file_record
+    chunk_bytes = record_size * MFT_READ_CHUNK_RECORDS
+    remaining = byte_length - (byte_length % record_size)
+    while remaining >= record_size:
+        to_read = min(chunk_bytes, remaining)
+        _, data = win32file.ReadFile(handle, to_read)
+        if not data:
+            break
+        usable = len(data) - (len(data) % record_size)
+        if usable <= 0:
+            break
+        record_index = _ingest_buffer(
+            data[:usable], geometry, record_index, entries, progress_callback, last_progress,
+        )
+        remaining -= usable
+        if len(data) < to_read:
+            break
+    return record_index
+
+
+def _open_mft_file(drive_root: str):
+    letter = drive_root[0]
+    return win32file.CreateFile(
+        f'\\\\.\\{letter}:\\$MFT',
+        win32file.GENERIC_READ,
+        win32file.FILE_SHARE_READ | win32file.FILE_SHARE_WRITE | win32file.FILE_SHARE_DELETE,
+        None,
+        win32file.OPEN_EXISTING,
+        win32con.FILE_FLAG_SEQUENTIAL_SCAN,
+        None,
+    )
+
+
+def _read_logical_mft_file(
+    drive_root: str,
+    geometry: VolumeGeometry,
+    entries: Dict[int, MftEntry],
+    progress_callback: Optional[Callable[[str, int], None]],
+) -> bool:
+    """Read \\.\\X:\\$MFT. Windows returns records in order across every fragment."""
+    handle = None
+    try:
+        handle = _open_mft_file(drive_root)
+        byte_length = _file_size(handle)
+        valid = geometry.mft_valid_data_length
+        if 0 < valid < byte_length or byte_length <= 0:
+            byte_length = valid
+        record_size = geometry.bytes_per_file_record
+        if byte_length < record_size:
+            return False
+        expected = byte_length // record_size
+        logging.info('Reading %s $MFT file (%s records)', drive_root, f'{expected:,}')
+        reached = _ingest_handle(
+            handle, byte_length, geometry, 0, entries, progress_callback, [0.0],
+        )
+        if reached < expected:
+            logging.info(
+                '$MFT file read stopped at record %s of %s',
+                f'{reached:,}',
+                f'{expected:,}',
+            )
+            entries.clear()
+            return False
+        return bool(entries)
+    except Exception as exc:
+        logging.info('$MFT file open failed for %s (%s)', drive_root, exc)
+        entries.clear()
+        return False
+    finally:
+        if handle is not None:
+            try:
+                win32file.CloseHandle(handle)
+            except Exception:
+                pass
+
+
+def _read_record_at(handle, offset: int, geometry: VolumeGeometry) -> Optional[bytes]:
+    _seek(handle, offset)
+    _, data = win32file.ReadFile(handle, geometry.bytes_per_file_record)
+    if len(data) < geometry.bytes_per_file_record:
+        return None
+    raw = bytearray(data[:geometry.bytes_per_file_record])
+    if not _apply_fixup(raw, geometry):
+        return None
+    return bytes(raw)
+
+
+def _extend_runs_from_attribute_list(
+    handle,
+    geometry: VolumeGeometry,
+    base_record: bytes,
+    runs: List[Tuple[int, int]],
+) -> List[Tuple[int, int]]:
+    """Follow a resident attribute list when the $MFT run list does not fit in record 0."""
+    merged = list(runs)
+    seen = {0}
+    for _starting_vcn, record_index in _attribute_list_targets(base_record):
+        if record_index in seen:
+            continue
+        seen.add(record_index)
+        offset = _record_disk_offset(merged, record_index, geometry)
+        if offset is None:
+            logging.info('MFT attribute-list record %s is outside the known runs', record_index)
+            continue
+        try:
+            extension = _read_record_at(handle, offset, geometry)
+        except Exception:
+            logging.info('Could not read MFT attribute-list record %s', record_index, exc_info=True)
+            continue
+        if not extension:
+            continue
+        extra = _unnamed_data_runs(extension)
+        if not extra:
+            continue
+        merged.extend(_parse_data_runs(extra))
+    return merged
+
+
+def _read_mft_runs(
+    handle,
+    geometry: VolumeGeometry,
+    entries: Dict[int, MftEntry],
+    progress_callback: Optional[Callable[[str, int], None]],
+) -> None:
+    record_size = geometry.bytes_per_file_record
+    cluster_size = geometry.bytes_per_cluster
+    base = _read_record_at(handle, geometry.mft_start_lcn * cluster_size, geometry)
+    if not base:
+        logging.warning('MFT record 0 could not be read')
+        return
+    run_blob = _unnamed_data_runs(base)
+    if not run_blob:
+        logging.warning('MFT record 0 has no $DATA run list')
+        return
+    runs = _extend_runs_from_attribute_list(
+        handle, geometry, base, _parse_data_runs(run_blob),
+    )
+    if not runs:
+        logging.warning('MFT $DATA run list was empty')
+        return
+
+    total_clusters = sum(count for _lcn, count in runs)
+    logical_bytes = total_clusters * cluster_size
+    valid = geometry.mft_valid_data_length
+    if valid > 0:
+        logical_bytes = min(logical_bytes, valid)
+    logging.info(
+        'Reading MFT by data runs: %s extents, %s records',
+        len(runs),
+        logical_bytes // record_size,
+    )
+
+    remaining = logical_bytes - (logical_bytes % record_size)
+    record_index = 0
+    last_progress = [0.0]
+    for lcn, clusters in runs:
+        if remaining < record_size:
+            break
+        run_bytes = min(clusters * cluster_size, remaining)
+        run_bytes -= run_bytes % record_size
+        planned = run_bytes // record_size
+        if lcn < 0:
+            record_index += planned
+        else:
+            _seek(handle, lcn * cluster_size)
+            start_index = record_index
+            record_index = _ingest_handle(
+                handle,
+                run_bytes,
+                geometry,
+                record_index,
+                entries,
+                progress_callback,
+                last_progress,
+            )
+            if record_index < start_index + planned:
+                logging.error(
+                    'MFT run at LCN %s ended early at record %s',
+                    lcn,
+                    f'{record_index:,}',
+                )
+                entries.clear()
+                return
+        remaining -= run_bytes
+    expected = logical_bytes // record_size
+    if record_index < expected:
+        logging.error(
+            'MFT runs covered %s of %s records',
+            f'{record_index:,}',
+            f'{expected:,}',
+        )
+        entries.clear()
+
+
 def _read_mft_entries(
     handle,
     geometry: VolumeGeometry,
+    drive_root: str,
     progress_callback: Optional[Callable[[str, int], None]] = None,
 ) -> Dict[int, MftEntry]:
-    record_size = geometry.bytes_per_file_record
-    mft_byte_offset = geometry.mft_start_lcn * geometry.bytes_per_cluster
-    win32file.SetFilePointer(handle, mft_byte_offset, win32con.FILE_BEGIN)
-
     entries: Dict[int, MftEntry] = {}
-    record_index = 0
-    last_progress = 0.0
-    chunk_bytes = record_size * MFT_READ_CHUNK_RECORDS
-
-    while True:
-        try:
-            _, data = win32file.ReadFile(handle, chunk_bytes)
-        except Exception:
-            break
-        if not data:
-            break
-
-        for offset in range(0, len(data), record_size):
-            raw = bytearray(data[offset: offset + record_size])
-            if len(raw) < record_size:
-                break
-            _apply_fixup(raw, geometry)
-            entry = _parse_file_record(bytes(raw), record_index, geometry)
-            if entry:
-                entries[record_index] = entry
-            record_index += 1
-
-            if progress_callback and time.time() - last_progress >= PROGRESS_INTERVAL:
-                progress_callback(f'MFT record {record_index:,}', record_index)
-                last_progress = time.time()
-
-        if len(data) < chunk_bytes:
-            break
-
+    if _read_logical_mft_file(drive_root, geometry, entries, progress_callback):
+        return entries
+    try:
+        _read_mft_runs(handle, geometry, entries, progress_callback)
+    except Exception:
+        logging.exception('MFT data-run read failed')
+        entries.clear()
     return entries
+
+
+def _mft_resolution_failed(entries: Dict[int, MftEntry], paths: Dict[int, str]) -> bool:
+    """True when almost every record was orphaned, which a linear volume read used to do."""
+    if len(entries) < 500:
+        return False
+    return len(paths) * 4 < len(entries)
 
 
 def _resolve_paths(
@@ -389,6 +787,7 @@ def _build_file_node(
     node._calculated_size = entry.size
 
     if entry.is_dir and _should_prune_children(path):
+        node.skip_recurse = True
         return node
 
     if not entry.is_dir:
@@ -411,6 +810,7 @@ def _build_file_node(
                 parent=node,
             )
             prune_node._calculated_size = child.size
+            prune_node.skip_recurse = True
             node.children.append(prune_node)
             node.dir_count += 1
             continue
@@ -460,18 +860,46 @@ def scan_drive_mft(
         if progress_callback:
             progress_callback(f'Reading MFT on {drive_root}', 0)
 
-        entries = _read_mft_entries(handle, geometry, progress_callback)
+        entries = _read_mft_entries(handle, geometry, drive_root, progress_callback)
         if not entries:
             logging.warning('MFT scan returned no entries')
             return None
 
         root_index = 5
         if root_index not in entries:
-            logging.warning('MFT scan: root directory record (index 5) not found')
-            return None
+            # Record 5's only file name is ".", which the parser drops. Children
+            # still point at it, so the drive root has to exist for the walk.
+            logging.info('MFT root name is not searchable; using the drive root')
+            entries[root_index] = MftEntry(
+                index=root_index,
+                parent_index=0,
+                name=drive_root.rstrip('\\') or drive_root,
+                is_dir=True,
+                size=0,
+            )
 
         paths = _resolve_paths(entries, root_index, drive_root)
+        if _mft_resolution_failed(entries, paths):
+            logging.error(
+                'MFT scan of %s kept %s paths out of %s records; falling back',
+                drive_root,
+                f'{len(paths):,}',
+                f'{len(entries):,}',
+            )
+            return None
         _aggregate_directory_sizes(entries, paths)
+
+        search_index = None
+        try:
+            from name_index import NameIndex
+            search_index = NameIndex.from_mft(
+                entries,
+                root_index,
+                drive_root,
+                paths.keys(),
+            )
+        except Exception:
+            logging.exception('Name index build from MFT failed')
 
         children_by_parent: Dict[int, List[int]] = defaultdict(list)
         for idx in paths:
@@ -482,6 +910,8 @@ def scan_drive_mft(
         root_node = _build_file_node(root_index, entries, paths, children_by_parent)
         if not root_node:
             return None
+        if search_index is not None:
+            root_node.search_index = search_index
 
         elapsed = time.time() - start
         logging.info(

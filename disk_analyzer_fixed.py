@@ -83,6 +83,7 @@ from usn_journal import (
     UsnJournalState,
 )
 from mft_scanner import scan_drive_mft, can_use_mft_scan
+from name_index import NameIndex, index_path_for_snapshot
 
 
 # Performance constants
@@ -112,6 +113,10 @@ class FileNode:
     parent: Optional['FileNode'] = None
     _calculated_size: Optional[int] = None
     frn: int = 0
+    # Set on folders whose children were not walked (node_modules, System Volume
+    # Information, and the other SKIP_DIRS_SCAN names). The name index keeps those
+    # descendants and must not delete them when a later scan sees an empty leaf.
+    skip_recurse: bool = False
 
     def get_size(self) -> int:
         """Get the total size including all children using a safe, iterative method."""
@@ -289,6 +294,7 @@ class FixedDiskScanner:
         self.event_queue = queue.Queue()
         self.cache_saver = DebouncedCacheSaver(self)
         self.root_node: Optional[FileNode] = None
+        self.name_index: Optional[NameIndex] = None
         
         # Initialize database
         self.init_database()
@@ -385,6 +391,18 @@ class FixedDiskScanner:
             
             if root_node:
                 FileNode.finalize_dir_size(root_node)
+                if getattr(root_node, 'search_index', None) is None:
+                    try:
+                        root_node.search_index = NameIndex.from_tree(root_node, partial=True)
+                    except Exception:
+                        logging.exception('Partial name index build failed')
+                self.name_index = getattr(root_node, 'search_index', None)
+                if self.name_index is not None:
+                    logging.info(
+                        'Search index ready: %s names, partial=%s',
+                        self.name_index.entry_count,
+                        self.name_index.partial,
+                    )
                 scan_time = time.time() - start_time
                 total_size = root_node.get_size()
                 
@@ -465,7 +483,8 @@ class FixedDiskScanner:
                                             name=dir_name,
                                             size=dir_size,
                                             is_dir=True,
-                                            parent=node
+                                            parent=node,
+                                            skip_recurse=True,
                                         )
                                         node.children.append(skip_node)
                                         node.dir_count += 1
@@ -546,6 +565,7 @@ class FixedDiskScanner:
                                     size=dir_size,
                                     is_dir=True,
                                     parent=parent_node,
+                                    skip_recurse=True,
                                 )
                                 parent_node.children.append(skip_node)
                                 parent_node.dir_count += 1
@@ -638,13 +658,24 @@ class FixedDiskScanner:
             return self.scan_directory(path, use_cache=False)
 
         logging.info(f"USN incremental refresh for {len(dirs_to_rescan)} directories")
+        refreshed: List[Tuple[str, FileNode]] = []
         for dir_path in sorted(dirs_to_rescan, key=len):
             self.update_progress(dir_path)
             fresh = self._rescan_directory(dir_path)
             if fresh:
                 self._apply_rescan_to_tree(root_node, dir_path, fresh)
+                refreshed.append((dir_path, fresh))
 
         FileNode.finalize_dir_size(root_node)
+        index = self.name_index or getattr(root_node, 'search_index', None)
+        if index is not None:
+            self.name_index = index
+            root_node.search_index = index
+            for dir_path, fresh in refreshed:
+                try:
+                    index.sync_scanned_directory(dir_path, fresh)
+                except Exception:
+                    logging.exception('Name index sync failed for %s', dir_path)
         if persist_snapshot:
             self.save_to_cache(root_node, state.journal_id, state.next_usn)
         else:
@@ -688,6 +719,66 @@ class FixedDiskScanner:
             pass
         return total
     
+    def _save_name_index(self, root_node: FileNode, snapshot_path: str) -> None:
+        index = getattr(root_node, 'search_index', None) or self.name_index
+        if index is None:
+            return
+        try:
+            index.save(index_path_for_snapshot(snapshot_path))
+        except Exception as exc:
+            logging.error('Name index save failed: %s', exc)
+
+    def _attach_name_index(self, root: FileNode, snapshot_path: Optional[str] = None) -> None:
+        """Load the saved name index, or build a partial one from the visible tree."""
+        candidates: List[str] = []
+        if snapshot_path:
+            candidates.append(index_path_for_snapshot(snapshot_path))
+        try:
+            candidates.append(index_path_for_snapshot(snapshot_file_path(self.db_path, root.path)))
+        except Exception:
+            pass
+        index = None
+        seen: Set[str] = set()
+        for candidate in candidates:
+            if not candidate or candidate in seen:
+                continue
+            seen.add(candidate)
+            if not os.path.isfile(candidate):
+                continue
+            index = NameIndex.load(candidate)
+            if index is not None:
+                logging.info(
+                    'Loaded name index %s (%s entries, partial=%s)',
+                    candidate,
+                    index.entry_count,
+                    index.partial,
+                )
+                break
+        if index is None:
+            try:
+                index = NameIndex.from_tree(root, partial=True)
+                logging.info(
+                    'Built partial name index from tree for %s (%s entries)',
+                    root.path,
+                    index.entry_count,
+                )
+            except Exception as exc:
+                logging.error('Partial name index build failed: %s', exc)
+                index = None
+        if index is not None:
+            root.search_index = index
+            self.name_index = index
+
+    def apply_watch_event(self, event) -> None:
+        """Patch the name index from a filesystem watch event."""
+        index = self.name_index
+        if index is None:
+            return
+        try:
+            index.apply_watch_event(event)
+        except Exception:
+            logging.debug('Search index live update failed', exc_info=True)
+
     def save_cache_metadata(self, root_node: FileNode, usn_journal_id: int = 0, usn_next: int = 0):
         """Update SQLite metadata only — fast path for live monitor (no snapshot rewrite)."""
         drive = root_node.path
@@ -725,6 +816,7 @@ class FixedDiskScanner:
                     snapshot_path,
                 )
                 conn.commit()
+            self._save_name_index(root_node, snapshot_path)
             logging.info(f'Saved mmap cache for {drive}')
         except Exception as e:
             logging.error(f'Mmap cache save error: {e}')
@@ -733,6 +825,7 @@ class FixedDiskScanner:
                     ensure_cache_schema(conn)
                     save_normalized_tree(conn, root_node, usn_journal_id, usn_next)
                     conn.commit()
+                self._save_name_index(root_node, snapshot_path)
                 logging.info(f'Saved normalized SQLite fallback cache for {drive}')
             except Exception as fallback_error:
                 logging.error(f'Cache save fallback error: {fallback_error}')
@@ -828,6 +921,7 @@ class FixedDiskScanner:
                         continue
                     elapsed = time.time() - start
                     logging.info(f'Loaded snapshot cache for {key} in {elapsed:.2f}s')
+                    self._attach_name_index(root, snapshot_path)
                     if snapshot_path.endswith('.mmap'):
                         logging.info(f'Migrating legacy mmap cache to compressed .snap for {key}')
                         with sqlite3.connect(self.db_path) as conn:
@@ -854,11 +948,13 @@ class FixedDiskScanner:
                             f"Loaded normalized cache for {key} in {elapsed:.2f}s "
                             f"({len(root.children)} top-level entries)"
                         )
+                        self._attach_name_index(root)
                         return root
 
                     root = load_pickle_tree(conn, key)
                     if root:
                         logging.info(f"Migrating pickle cache to mmap format for {key}")
+                        self._attach_name_index(root)
                         meta = get_cache_meta(conn, key)
                         journal_id = meta[1] if meta else 0
                         usn_next = meta[2] if meta else 0

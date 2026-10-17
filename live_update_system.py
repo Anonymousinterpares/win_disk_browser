@@ -301,6 +301,7 @@ class LiveUpdateManager:
             Set of parent paths that were affected
         """
         affected_parents = set()
+        self.scanner.apply_watch_event(event)
         path = event.src_path
         parent_dir = os.path.dirname(path)
         

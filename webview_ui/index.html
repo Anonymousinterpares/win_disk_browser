@@ -23,8 +23,15 @@
             </label>
             <div class="spacer"></div>
             <div class="search-wrapper">
-                <input type="search" id="search-input" placeholder="Search for a file or folder...">
-                <div id="search-results-container"></div>
+                <div class="search-kind" role="group" aria-label="Search files or folders">
+                    <button type="button" id="search-kind-both" class="active" data-kind="both" title="Search files and folders">All</button>
+                    <button type="button" id="search-kind-files" data-kind="file" title="Search file names only">Files</button>
+                    <button type="button" id="search-kind-dirs" data-kind="dir" title="Search folder names only">Folders</button>
+                </div>
+                <div class="search-field">
+                    <input type="search" id="search-input" placeholder="Name, report*, *.pdf, *cache*" title="Exact name, or * as a wildcard">
+                    <div id="search-results-container"></div>
+                </div>
             </div>
             <button id="reset-view-button" title="Reset View" class="icon-button" style="display: none;">🏠</button>
             <div id="treemap-mode-toggle" class="view-toggle" style="margin-right: 20px;">

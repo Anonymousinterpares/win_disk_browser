@@ -5,7 +5,15 @@ import os
 import sys
 import json
 import logging
-import math
+
+def resource_path(relative_path: str) -> str:
+    """Resolve path for both source runs and PyInstaller bundles."""
+    if hasattr(sys, '_MEIPASS'):
+        base = sys._MEIPASS
+    else:
+        base = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(base, relative_path)
+
 
 # Ensure current directory is in Python path for PyInstaller
 if hasattr(sys, '_MEIPASS'):
@@ -16,6 +24,7 @@ else:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from disk_analyzer_fixed import FixedDiskScanner, FileNode
+from name_index import NameIndex
 import colorsys
 from copy import deepcopy
 from typing import Dict, List, Tuple, Optional, Union
@@ -347,6 +356,7 @@ class Api:
     """
     def __init__(self):
         self._scan_result_root: Optional[FileNode] = None
+        self._name_index: Optional[NameIndex] = None
         self.lod_system = NaniteLODSystem()
         self._viewport_size = (1280, 800)
         self._current_zoom = 1.0
@@ -395,6 +405,8 @@ class Api:
         generation = self._dataset_generation
         self._dataset_path = self._normalize_path(os.path.abspath(path))
         self._scan_result_root = None
+        self._name_index = None
+        scanner.name_index = None
         self._initial_pruned_data = None
         self._structure_view_cache.clear()
         self._top_list_generation = generation
@@ -456,9 +468,29 @@ class Api:
             generation,
         )
 
+    def _adopt_search_index(self, root_node: Optional[FileNode]) -> None:
+        """Use the scan's name index. Build a partial one only when nothing is loaded."""
+        if root_node is None:
+            self._name_index = None
+            return
+        index = getattr(root_node, 'search_index', None)
+        if index is None:
+            index = scanner.name_index
+        if index is None:
+            try:
+                index = NameIndex.from_tree(root_node, partial=True)
+            except Exception:
+                logging.exception('Partial name index build failed')
+                index = None
+        if index is not None:
+            root_node.search_index = index
+            scanner.name_index = index
+        self._name_index = index
+
     def _set_scan_result(self, root_node: Optional[FileNode], warm_indexes: bool = True) -> None:
         """Store scan data and optionally warm derived indexes (sizes, top-list)."""
         self._scan_result_root = root_node
+        self._adopt_search_index(root_node)
         if root_node:
             FileNode.ensure_tree_sizes(root_node)
             if warm_indexes:
@@ -1099,58 +1131,50 @@ class Api:
             logging.error(f"Error opening location {path}: {e}")
             return False
     
-    def search_nodes(self, query: str):
-        """Search with relevance scoring."""
-        if not self._scan_result_root or not query:
-            return []
-        
-        logging.info(f"Searching for: '{query}'")
-        results = []
-        SEARCH_LIMIT = 50
-        
-        lower_query = query.lower()
-        q = deque([self._scan_result_root])
-        
-        while q and len(results) < SEARCH_LIMIT:
-            current = q.popleft()
-            
-            # Score based on match quality
-            score = 0
-            name_lower = current.name.lower()
-            
-            if lower_query in name_lower:
-                # Higher score for exact matches
-                if lower_query == name_lower:
-                    score = 100
-                # Higher score for prefix matches
-                elif name_lower.startswith(lower_query):
-                    score = 80
-                # Standard score for contains
-                else:
-                    score = 50
-                
-                # Bonus for larger files
-                size_bonus = min(20, math.log10(current.get_size() + 1) * 2)
-                score += size_bonus
-                
-                results.append({
-                    'name': current.name,
-                    'path': current.path,
-                    'value': current.get_size(),
-                    'score': score
-                })
-            
-            for child in current.children:
-                q.append(child)
-        
-        # Sort by score
-        results.sort(key=lambda x: x['score'], reverse=True)
-        
-        # Remove score from final results
-        for r in results:
-            del r['score']
-        
-        return results
+    def search_nodes(self, query: str, kind: str = 'both'):
+        """Search file or folder names. kind is 'file', 'dir', or 'both'.
+
+        Patterns: exact text, prefix*, *suffix, *contains*, and report*2024*.pdf.
+        An exact miss of 3+ characters falls back to a contains search.
+        """
+        query = (query or '').strip()
+        if not query:
+            return {'results': [], 'total': 0, 'partial': True, 'expanded': False, 'message': ''}
+        if kind not in ('file', 'dir', 'both'):
+            kind = 'both'
+        index = self._name_index
+        if index is None and self._scan_result_root is not None:
+            self._adopt_search_index(self._scan_result_root)
+            index = self._name_index
+        if index is None:
+            return {
+                'results': [],
+                'total': 0,
+                'partial': True,
+                'expanded': False,
+                'message': 'Scan a drive before searching.',
+            }
+        try:
+            payload = index.search(query, kind=kind, limit=100)
+        except Exception:
+            logging.exception('Name search failed')
+            return {
+                'results': [],
+                'total': 0,
+                'partial': True,
+                'expanded': False,
+                'message': 'Search failed.',
+            }
+        logging.debug(
+            "Search '%s' kind=%s -> %s/%s partial=%s expanded=%s",
+            query,
+            kind,
+            len(payload.get('results', ())),
+            payload.get('total', 0),
+            payload.get('partial'),
+            payload.get('expanded'),
+        )
+        return payload
     
     def _find_node_by_path(self, path: str) -> Optional[FileNode]:
         """Find a node by path within the API's own root_node."""
@@ -1211,6 +1235,7 @@ class Api:
                 if updated:
                     self._scan_result_root = updated
                     scanner.root_node = updated
+                    self._adopt_search_index(updated)
             finally:
                 scanner.set_progress_callback(None)
 
@@ -1332,6 +1357,7 @@ class Api:
                     # --- END OF THE DEFINITIVE FIX ---
                     
                     try:
+                        scanner.apply_watch_event(evt)
                         path = evt.src_path
                         parent_dir = os.path.dirname(path)
                         parent_node = self._find_node_by_path(parent_dir)
@@ -1777,9 +1803,10 @@ def main():
         logging.info(f"Visual analyzer will auto-load: {auto_load_path}")
     
     global window
+    ui_path = resource_path(os.path.join('webview_ui', 'index.html'))
     window = webview.create_window(
         'DiskInsight Pro - Enhanced Visual Analyzer',
-        'webview_ui/index.html',
+        ui_path,
         js_api=api,
         width=1280,
         height=800,
