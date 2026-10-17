@@ -459,6 +459,65 @@ input:checked + .slider:before { transform: translateX(26px); }
     min-height: 0;
 }
 
+.exclude-section {
+    flex: 0 0 auto;
+    background-color: #333;
+    border-bottom: 1px solid var(--border-color);
+}
+
+.exclude-toggle {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    width: 100%;
+    padding: 6px 12px;
+    background: transparent;
+    border: 0;
+    color: var(--text-color);
+    cursor: pointer;
+    font-size: 12px;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    text-align: left;
+}
+
+.exclude-toggle:hover {
+    background-color: #3a3a3a;
+}
+
+.exclude-toggle.open {
+    letter-spacing: 0;
+    font-weight: 500;
+}
+
+.exclude-body {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 4px 14px;
+    max-height: 112px;
+    overflow: auto;
+    padding: 0 12px 8px 32px;
+}
+
+.exclude-body[hidden] {
+    display: none;
+}
+
+.exclude-type {
+    display: inline-flex;
+    align-items: center;
+    gap: 4px;
+    color: #ddd;
+    cursor: pointer;
+    font-size: 12px;
+    user-select: none;
+}
+
+.exclude-type input {
+    cursor: pointer;
+    margin: 0;
+}
+
 .explorer-container {
     flex: 1;
     display: flex;

@@ -66,6 +66,13 @@
             <div id="breadcrumb-container"></div>
             <div id="chart-container"></div>
             <div id="treeview-container" style="display: none;">
+                <section id="exclude-section" class="exclude-section">
+                    <button type="button" id="exclude-toggle" class="exclude-toggle" aria-expanded="false" aria-controls="exclude-body">
+                        <span id="exclude-chevron" aria-hidden="true">▸</span>
+                        <span id="exclude-label">EXCLUDE</span>
+                    </button>
+                    <div id="exclude-body" class="exclude-body" hidden></div>
+                </section>
                 <div class="explorer-container">
                     <!-- Left Panel - Directory Tree -->
                     <div class="tree-panel">

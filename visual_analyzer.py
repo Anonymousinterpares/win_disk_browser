@@ -24,6 +24,7 @@ else:
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from disk_analyzer_fixed import FixedDiskScanner, FileNode
+from exclude_config import ExcludeConfigError, load_settings, reset_settings, save_excluded
 from name_index import NameIndex
 import colorsys
 from copy import deepcopy
@@ -387,6 +388,20 @@ class Api:
         self.event_queue = queue.Queue()
         self.live_update_thread = None
         self._stop_live_updates_flag = threading.Event()
+        # View filter only. Loaded once per process start; ticks rewrite the JSON file.
+        try:
+            self._exclude_settings = load_settings()
+            if self._exclude_settings.get('corrupted'):
+                logging.warning('exclude_config.json is damaged; waiting for a restore choice')
+            else:
+                logging.info(
+                    'Exclude config loaded: %s types, hidden %s',
+                    len(self._exclude_settings.get('extensions') or []),
+                    self._exclude_settings.get('excluded'),
+                )
+        except Exception:
+            logging.exception('Exclude config could not be loaded')
+            self._exclude_settings = {'extensions': [], 'excluded': [], 'corrupted': True}
 
     @staticmethod
     def _normalize_path(path: str) -> str:
@@ -1699,6 +1714,35 @@ class Api:
             },
         }
     
+    def get_exclude_settings(self) -> Dict:
+        """Extensions and which of them are hidden in TreeView. Does not read the database."""
+        return {
+            'extensions': list(self._exclude_settings.get('extensions') or []),
+            'excluded': list(self._exclude_settings.get('excluded') or []),
+            'corrupted': bool(self._exclude_settings.get('corrupted')),
+        }
+
+    def set_excluded_extensions(self, excluded) -> Dict:
+        """Save ticked types. The scan cache is left untouched."""
+        try:
+            self._exclude_settings = save_excluded(excluded)
+        except ExcludeConfigError as exc:
+            logging.warning('%s', exc)
+            return {'error': str(exc), 'corrupted': True}
+        except Exception as exc:
+            logging.exception('Exclude config could not be saved')
+            return {'error': str(exc)}
+        return self.get_exclude_settings()
+
+    def reset_exclude_config(self) -> Dict:
+        """Rewrite exclude_config.json to the hardcoded file types."""
+        try:
+            self._exclude_settings = reset_settings()
+        except Exception as exc:
+            logging.exception('Exclude config could not be restored')
+            return {'error': str(exc)}
+        return self.get_exclude_settings()
+
     def get_directory_contents(self, path: str) -> Dict:
         """Get files and folders in a specific directory (Windows Explorer style)"""
         try:

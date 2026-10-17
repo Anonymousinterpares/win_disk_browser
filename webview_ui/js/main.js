@@ -35,6 +35,12 @@ window.addEventListener('pywebviewready', function() {
     const collapseAllBtn = document.getElementById('collapse-all-btn');
     const navBackBtn = document.getElementById('nav-back-btn');
     const navForwardBtn = document.getElementById('nav-forward-btn');
+    const excludeToggle = document.getElementById('exclude-toggle');
+    const excludeLabel = document.getElementById('exclude-label');
+    const excludeChevron = document.getElementById('exclude-chevron');
+    const excludeBody = document.getElementById('exclude-body');
+    let excludedExtensions = new Set();
+    let excludeSaveQueue = Promise.resolve();
     const scanProgressOverlay = document.getElementById('scan-progress-overlay');
     const scanProgressTitle = document.getElementById('scan-progress-title');
     const scanProgressBar = document.getElementById('scan-progress-bar');
@@ -2101,8 +2107,14 @@ chartToggle.addEventListener('change', () => {
                 return;
             }
             
-            // Apply current sort if any
-            const sortedContents = applySortToContents(contents);
+            // Apply current sort, then hide ticked file types. Folders stay visible.
+            const sortedContents = applyExcludeFilter(applySortToContents(contents));
+
+            if (sortedContents.length === 0) {
+                fileListContainer.innerHTML = '<div class="empty-folder">Files of the excluded types are hidden</div>';
+                treeViewDebug.timeEnd('renderDirectoryContents');
+                return;
+            }
             
             // Create table
             treeViewDebug.time('Table Creation');
@@ -2217,6 +2229,115 @@ chartToggle.addEventListener('change', () => {
         }
     }
     
+    function fileExtension(name) {
+        const text = String(name || '');
+        const dot = text.lastIndexOf('.');
+        if (dot <= 0 || dot === text.length - 1) return '';
+        return text.slice(dot + 1).toLowerCase();
+    }
+
+    function isExcludedFile(item) {
+        if (!item || item.is_dir) return false;
+        const ext = fileExtension(item.name);
+        return ext !== '' && excludedExtensions.has(ext);
+    }
+
+    function applyExcludeFilter(contents) {
+        if (excludedExtensions.size === 0) return contents;
+        return contents.filter(item => !isExcludedFile(item));
+    }
+
+    function setExcludeOpen(open) {
+        excludeToggle.setAttribute('aria-expanded', open ? 'true' : 'false');
+        excludeToggle.classList.toggle('open', open);
+        excludeLabel.textContent = open ? 'exclude file types' : 'EXCLUDE';
+        excludeChevron.textContent = open ? '▾' : '▸';
+        excludeBody.hidden = !open;
+    }
+
+    function renderExcludeTypes(extensions, excluded) {
+        excludedExtensions = new Set(excluded || []);
+        excludeBody.replaceChildren();
+        (extensions || []).forEach(ext => {
+            const label = document.createElement('label');
+            label.className = 'exclude-type';
+            const box = document.createElement('input');
+            box.type = 'checkbox';
+            box.checked = excludedExtensions.has(ext);
+            box.addEventListener('change', () => {
+                if (box.checked) excludedExtensions.add(ext);
+                else excludedExtensions.delete(ext);
+                if (treeViewOperationState.currentContents) {
+                    renderDirectoryContents(treeViewOperationState.currentContents);
+                }
+                const snapshot = Array.from(excludedExtensions);
+                excludeSaveQueue = excludeSaveQueue
+                    .catch(() => {})
+                    .then(() => pywebview.api.set_excluded_extensions(snapshot))
+                    .then(result => {
+                        if (result && result.corrupted) {
+                            statusBar.textContent = 'exclude_config.json is damaged and was left unchanged.';
+                            return;
+                        }
+                        if (!result || result.error) {
+                            statusBar.textContent = 'Could not save exclude settings.';
+                        }
+                    })
+                    .catch(() => {
+                        statusBar.textContent = 'Could not save exclude settings.';
+                    });
+            });
+            label.appendChild(box);
+            label.appendChild(document.createTextNode('.' + ext));
+            excludeBody.appendChild(label);
+        });
+    }
+
+    function applyExcludeSettings(settings) {
+        renderExcludeTypes(settings.extensions || [], settings.excluded || []);
+        if (treeViewOperationState.currentContents) {
+            renderDirectoryContents(treeViewOperationState.currentContents);
+        }
+    }
+
+    function askToRestoreExcludeConfig() {
+        return window.confirm(
+            'exclude_config.json is damaged and could not be read.\n\n' +
+            'Restore it to the default file types? Choosing No leaves the file unchanged.'
+        );
+    }
+
+    function restoreExcludeConfig() {
+        return pywebview.api.reset_exclude_config().then(fresh => {
+            if (!fresh || fresh.error) {
+                statusBar.textContent = 'Could not restore exclude_config.json.';
+                return;
+            }
+            applyExcludeSettings(fresh);
+            statusBar.textContent = 'exclude_config.json was restored to the default file types.';
+        }).catch(() => {
+            statusBar.textContent = 'Could not restore exclude_config.json.';
+        });
+    }
+
+    function loadExcludeSettings() {
+        pywebview.api.get_exclude_settings().then(settings => {
+            if (!settings || settings.error) return;
+            if (settings.corrupted) {
+                if (!askToRestoreExcludeConfig()) {
+                    applyExcludeSettings(settings);
+                    statusBar.textContent = 'exclude_config.json was left unchanged.';
+                    return;
+                }
+                restoreExcludeConfig();
+                return;
+            }
+            applyExcludeSettings(settings);
+        }).catch(error => {
+            console.error('Exclude settings failed to load', error);
+        });
+    }
+
     // Apply sorting to contents array
     function applySortToContents(contents) {
         if (!treeViewOperationState.sortColumn || !treeViewOperationState.sortDirection) {
@@ -3370,6 +3491,11 @@ chartToggle.addEventListener('change', () => {
     statusBar.textContent = 'Ready. Select a drive and click Scan or Load Cache.';
     
     // Initialize TreeView mode as default
+    excludeToggle.addEventListener('click', () => {
+        const open = excludeToggle.getAttribute('aria-expanded') === 'true';
+        setExcludeOpen(!open);
+    });
+    loadExcludeSettings();
     setTreemapMode('treeview');
     
     console.log('[Init] Visual analyzer ready. TreeView mode is now the default.');
